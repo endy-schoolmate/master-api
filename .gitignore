@@ -1,0 +1,51 @@
+# Python byte code
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Environments & Secrets (CRITICAL: Never commit secrets)
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# SQLite Database files (CRITICAL: Contains your private API keys & logs)
+*.db
+*.sqlite
+*.sqlite3
+master.db
+gateway/master.db
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+
+# Logs
+logs/
+*.log
+trace.log
+uvicorn.log
+
+# Temporary / Scratch / Backup files
+*.bak
+*.bak-*
+temp_script*
+scratch/
+
+# AI assistant workspace files (may contain private conversation data)
+.zcode/
+.claude/
+.cursor/
+
+# OS & Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
