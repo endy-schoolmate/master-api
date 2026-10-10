@@ -17,7 +17,22 @@
 - 🔐 **高强度密钥加密**：基于 Fernet + HKDF-SHA256 加密入库，前端严格脱敏展示，查看明文触发审计日志；
 - 📊 **全量请求观测**：记录 HTTP 状态码、响应耗时、Token 用量、调用模型及客户端标识，全链路可审计；
 - 🎨 **原生现代化控制台**：内置轻量控制台（Mono Premium 黑白双主题），单文件前端，零构建开箱即用；
+- 💬 **内置网页对话**：控制台自带独立 Chat 板块——会话管理、流式输出与思考过程折叠、图片/PDF 附件、Markdown 与 KaTeX 公式渲染、编辑重发（rewind）、模型与推理等级自由选择，登录即用零配置；
 - 🏠 **纯本地安全运行**：默认绑定 `127.0.0.1:8000`，无需繁杂证书配置，各类第三方客户端直接连接。
+
+---
+
+## 界面预览
+
+> 以下截图均基于**虚构的演示数据**生成，不包含任何真实密钥、日志或个人数据。
+
+| 仪表盘 | 上游密钥 | 聚合模型 |
+| :---: | :---: | :---: |
+| <img src="docs/screenshots/dashboard.png" width="430" alt="仪表盘"> | <img src="docs/screenshots/upstreams.png" width="430" alt="上游密钥"> | <img src="docs/screenshots/virtual-models.png" width="430" alt="聚合模型"> |
+
+| 创建 API Key | 请求日志 | 网页对话 |
+| :---: | :---: | :---: |
+| <img src="docs/screenshots/api-keys.png" width="430" alt="创建 API Key"> | <img src="docs/screenshots/request-logs.png" width="430" alt="请求日志"> | <img src="docs/screenshots/web-chat.png" width="430" alt="网页对话"> |
 
 ---
 
@@ -90,6 +105,23 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 
 ---
 
+## 网页对话（内置 Chat 客户端）
+
+管理控制台内置独立的**网页对话**板块，登录即用、无需任何额外配置：
+
+- **会话管理**：侧栏按「今天 / 7 天内 / 30 天内 / 更早」分组，支持新建、重命名、删除会话；生成过程中可自由切换会话，任务转后台继续并回写原会话；
+- **流式输出**：SSE 实时渲染 Markdown，生成中可随时中断（已生成部分自动保留入库）；
+- **思考过程**：模型推理内容以「已深度思考」折叠框呈现，完成后自动收纳、可随时点开回看；
+- **富媒体输入**：支持图片（自动压缩至 2048px）与文档（TXT / MD / PDF）附件，随消息持久化保存；
+- **公式与代码**：内置 KaTeX 0.16 离线渲染 LaTeX 公式，代码块保持语法高亮；
+- **编辑重发**：任意用户消息旁点「编辑重发」，自动截断旧分支后以新文案重新生成，标题随首条消息联动更新；
+- **模型随心选**：发送键旁选择器直连「上游密钥」中的全部真实模型（按供应商分组，`provider::model` 精确锁定），并可选择推理等级（reasoning_effort）；
+- **免配置鉴权**：浏览器端自动携带管理员登录 Token 调用网关，网页对话无需单独配置 API Key（外部客户端仍走 `acu_` / `sk-` Key 鉴权）。
+
+<img src="docs/screenshots/web-chat.png" width="720" alt="网页对话界面">
+
+---
+
 ## 常用环境配置（.env）
 
 | 配置项 | 说明 | 默认值 |
@@ -119,6 +151,8 @@ master-api/
 │   │   ├── database_sqlite.py # SQLite 数据持久化与自建表
 │   │   └── static/         # 前端控制台静态资源
 │   └── requirements.txt
+├── docs/
+│   └── screenshots/        # 界面预览截图（虚构演示数据）
 ├── .env.example            # 配置项模板
 ├── .gitignore              # Git 忽略规则（保护数据库与密钥）
 ├── requirements.txt        # Python 依赖清单
