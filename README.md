@@ -26,13 +26,17 @@
 
 > 以下截图均基于**虚构的演示数据**生成，不包含任何真实密钥、日志或个人数据。
 
-| 仪表盘 | 上游密钥 | 聚合模型 |
-| :---: | :---: | :---: |
-| <img src="docs/screenshots/dashboard.png" width="430" alt="仪表盘"> | <img src="docs/screenshots/upstreams.png" width="430" alt="上游密钥"> | <img src="docs/screenshots/virtual-models.png" width="430" alt="聚合模型"> |
+| 仪表盘 (Dashboard) | 内置网页对话 (Web Chat) |
+| :---: | :---: |
+| [![仪表盘](docs/screenshots/dashboard.png)](docs/screenshots/dashboard.png) | [![网页对话](docs/screenshots/web-chat.png)](docs/screenshots/web-chat.png) |
 
-| 创建 API Key | 请求日志 | 网页对话 |
-| :---: | :---: | :---: |
-| <img src="docs/screenshots/api-keys.png" width="430" alt="创建 API Key"> | <img src="docs/screenshots/request-logs.png" width="430" alt="请求日志"> | <img src="docs/screenshots/web-chat.png" width="430" alt="网页对话"> |
+| 上游密钥管理 (Upstreams) | 聚合模型与故障转移 (Virtual Models) |
+| :---: | :---: |
+| [![上游密钥](docs/screenshots/upstreams.png)](docs/screenshots/upstreams.png) | [![聚合模型](docs/screenshots/virtual-models.png)](docs/screenshots/virtual-models.png) |
+
+| 客户端 API Key 签发 (API Keys) | 全量请求日志追踪 (Request Logs) |
+| :---: | :---: |
+| [![创建 API Key](docs/screenshots/api-keys.png)](docs/screenshots/api-keys.png) | [![请求日志](docs/screenshots/request-logs.png)](docs/screenshots/request-logs.png) |
 
 ---
 
