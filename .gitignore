@@ -49,3 +49,6 @@ scratch/
 *~
 .DS_Store
 Thumbs.db
+# SQLite WAL/SHM sidecar files (live request data)
+*.db-shm
+*.db-wal

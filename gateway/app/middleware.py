@@ -295,7 +295,10 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
 
     # 响应体最大记录长度（避免内存爆炸）
     MAX_RESPONSE_BODY_LEN = 65536  # 64KB（读取上限）
-    MAX_REQUEST_BODY_LEN = 16384   # 16KB（读取上限）
+    # 请求体读取上限：脱敏时 messages/prompt 等大字段会被替换为 [OMITTED]，
+    # 存储体积很小，因此读取上限放宽到 1MB——Agent 请求带完整上下文动辄上百KB，
+    # 之前 16KB 上限会把请求整个替换成"[请求体过大]"，连 model/reasoning 等参数都看不到
+    MAX_REQUEST_BODY_LEN = 1048576  # 1MB（读取上限，脱敏后存储）
     # 存储时截断长度（优化：避免DB膨胀）
     STORE_REQUEST_BODY_LEN = 4096   # 请求体存储上限4KB
     STORE_RESPONSE_BODY_LEN = 2048  # 响应体存储上限2KB
@@ -375,7 +378,20 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
 
         #  存储截断：防止大字段导致DB膨胀
         if len(request_body) > self.STORE_REQUEST_BODY_LEN:
+            try:
+                _parsed = json.loads(request_body)
+                _digest = json.dumps(
+                    {k: v for k, v in _parsed.items()
+                     if k not in self._OMIT_FIELDS and k not in ("tools", "tool_choice")},
+                    ensure_ascii=False,
+                )
+            except Exception:
+                _digest = ""
             request_body = request_body[:self.STORE_REQUEST_BODY_LEN] + f"...[截断: 原{len(request_body)}B]"
+            if _digest:
+                # 顶层小参数（model/stream/reasoning/enable_thinking/temperature 等）
+                # 序列化在 JSON 尾部，头部截断会丢掉——显式附在摘要里保证可见
+                request_body += f"\n[顶层参数] {_digest[:1500]}"
 
         # 执行请求
         error_type = ""
@@ -468,7 +484,7 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
         if response_status >= 400 and attempts:
             context = {
                 "final": self._sanitize_text(error_detail or f"HTTP {response_status}"),
-                "attempts": attempts[:8],
+                "attempts": attempts[:16],
             }
             error_detail = json.dumps(context, ensure_ascii=False)[:self.STORE_ERROR_STACK_LEN]
 

@@ -25,6 +25,8 @@
 """
 import asyncio
 import json
+import re
+import threading
 import time
 import traceback
 import uuid
@@ -138,10 +140,17 @@ STREAM_CHUNK_IDLE_TIMEOUT = 180  # 3分钟（推理模型思考时间可能很�
 # ========== 自定义异常 ==========
 
 class UpstreamRetryableError(Exception):
-    """上游瞬时/密钥级错误；可换 key 或切换聚合候选。"""
+    """上游瞬时/密钥级错误；可换 key 或切换聚合候选。
 
-    def __init__(self, message: str, status_code: int | None = None):
+    kind 是错误分级标签，聚合链据此决定"同一候选模型内还重试几次"：
+    - timeout（读/响应超时，等待成本高）与 no_key（无可用密钥，重选无意义）
+      立即切换下一个候选；
+    - 其余（429/401/403/5xx/网络/空响应等）保留换 key 重试机会，容忍偶发抖动。
+    """
+
+    def __init__(self, message: str, status_code: int | None = None, kind: str = "upstream_error"):
         self.status_code = status_code
+        self.kind = kind
         super().__init__(message)
 
 
@@ -230,17 +239,194 @@ def _should_failover_after_request_error(error: UpstreamRequestError) -> bool:
     return not any(marker in message for marker in terminal_markers)
 
 
-def _record_upstream_attempt(request: Request | None, model_ref: str, error: Exception) -> None:
+def _attempt_row_status(error: Exception) -> int:
+    """候选尝试行的状态码：无上游状态时按错误分级映射（与链尾返回给客户端的口径一致）。"""
+    kind = getattr(error, "kind", "") or ""
+    status = getattr(error, "status_code", None)
+    if isinstance(status, int) and status > 0:
+        return status
+    if kind == "timeout":
+        return 504
+    if kind == "no_key":
+        return 503
+    return 502  # network/empty/upstream_error/其他：上游侧故障
+
+
+def _log_chain_attempt_row(request: Request | None, model_ref: str, error: Exception, attempt_started: float | None, body: dict | None = None) -> None:
+    """把一次候选尝试独立落一行请求日志（log_category=chain_attempt）。
+
+    聚合模型的一次客户端请求会展开成多个真实模型尝试，只有行级记录
+    才能在"请求日志"里直接看到每个备用模型的具体报错（而不是只看到
+    虚拟模型 ID 的最终一行）。失败写入放后台线程，不阻塞链路切换。
+    """
+    try:
+        if isinstance(error, UpstreamRetryableError):
+            kind = getattr(error, "kind", "") or "upstream_error"
+            reason = {
+                "timeout": "超时",
+                "connect_timeout": "连接超时",
+                "network": "网络错误",
+                "no_key": "无可用密钥",
+                "rate_limited": "上游限流",
+                "auth": "密钥认证失败",
+                "forbidden": "上游拒绝",
+                "server": "上游服务错误",
+                "empty": "空响应",
+                "oauth": "OAuth凭据失败",
+            }.get(kind, "瞬时失败")
+            text = _safe_error_message(str(error))
+        elif isinstance(error, UpstreamModelUnavailableError):
+            kind, reason, text = "model_unavailable", "模型不可用", _safe_error_message(error.error_body)
+        elif isinstance(error, UpstreamRequestError):
+            kind, reason, text = "request_error", "请求级错误", _safe_error_message(error.error_body)
+        else:
+            kind, reason, text = type(error).__name__, "异常", str(error)
+
+        now = time.time()
+        rt = max(0.0, now - attempt_started) if attempt_started else 0.0
+        state = getattr(request, "state", None)
+        try:
+            client_ip = get_client_ip(request) if request is not None else ""
+        except Exception:
+            client_ip = ""
+        try:
+            ua = (request.headers.get("user-agent", "") or "")[:512] if request is not None else ""
+        except Exception:
+            ua = ""
+        # 该候选实际发出的请求体：脱敏（messages 等省略）+ 截断，供详情核对参数是否被剥离
+        attempt_body = ""
+        if body:
+            try:
+                from app.middleware import RequestLoggingMiddleware
+                attempt_body = RequestLoggingMiddleware._sanitize_request_body(
+                    json.dumps(body, ensure_ascii=False)
+                )[:4096]
+            except Exception:
+                attempt_body = ""
+        _log_request_sync(
+            client_id=getattr(state, "log_client_id", "") or "",
+            key_id="",
+            model=model_ref,
+            status_code=_attempt_row_status(error),
+            rt=rt,
+            prompt_tokens=0, completion_tokens=0, total_tokens=0,
+            is_stream=bool(getattr(state, "log_is_stream", False)),
+            error_msg=f"{reason}: {text}"[:512],
+            start_ts=attempt_started,
+            error_type="ChainAttempt",
+            error_detail=f"{reason}: {text}"[:1024],
+            business_code=kind,
+            request_path=str(getattr(getattr(request, "url", None), "path", "") or ""),
+            http_method=getattr(request, "method", ""),
+            client_ip=client_ip,
+            user_agent=ua,
+            request_body=attempt_body,
+            include_errors=True,
+            force_log_category="chain_attempt",
+        )
+    except Exception:
+        logger.debug("记录候选尝试日志失败", exc_info=True)
+
+
+# ========== 候选参数自适应（上游 400 "unsupported parameter" 剥离与学习） ==========
+# ZCode 等客户端会给所有请求附带 reasoning / enable_thinking / reasoning_effort 等
+# 非标准参数，不同上游接受度不一。某候选报"参数不支持"时：解析出参数名 →
+# 从请求体剥离 → 同候选原地重试，并把参数记入该候选的黑名单，
+# 同一次请求中排在后面的候选会预防性应用同一黑名单，不再白白消耗候选。
+
+_PARAM_BLOCKLIST_MAX_MODELS = 256
+_param_blocklist: dict[str, set[str]] = {}  # real_model_ref -> 该上游不接受的参数名
+_param_blocklist_lock = threading.Lock()
+
+_ESSENTIAL_BODY_KEYS = {"model", "messages", "stream", "stream_options", "tools", "tool_choice"}
+
+_UNSUPPORTED_PARAM_RE = re.compile(
+    r"unsupported parameter|unrecognized request argument|unknown (?:parameter|argument)"
+    r"|invalid parameter|does not support parameter|不支持参数|参数不支持",
+    re.I,
+)
+_PARAM_NAME_RE = re.compile(r"[`'\"“”]([a-zA-Z_][a-zA-Z0-9_]{0,40})[`'\"“”]|supplied:\s*([a-zA-Z_][a-zA-Z0-9_]{0,40})")
+
+
+def _match_unsupported_params(message: str) -> list[str]:
+    """从上游错误消息里解析"不被支持的参数名"列表（最多6个）。"""
+    if not _UNSUPPORTED_PARAM_RE.search(message or ""):
+        return []
+    essential_lower = {k.lower() for k in _ESSENTIAL_BODY_KEYS}
+    names: list[str] = []
+    for mt in _PARAM_NAME_RE.finditer(message):
+        name = mt.group(1) or mt.group(2)
+        if name and name.lower() not in essential_lower and name not in names:
+            names.append(name)
+        if len(names) >= 6:
+            break
+    return names
+
+
+def _strip_blocked_params(real_model: str, sub_body: dict) -> list[str]:
+    """按学习到的黑名单预防性剥离参数；返回实际剥离的名单。"""
+    with _param_blocklist_lock:
+        blocked = _param_blocklist.get(real_model)
+    if not blocked:
+        return []
+    stripped = [k for k in list(sub_body.keys()) if k in blocked]
+    for k in stripped:
+        sub_body.pop(k, None)
+    return stripped
+
+
+def _learn_param_blocklist(real_model: str, names: list[str]) -> None:
+    """把解析出的不支持参数记入该候选的黑名单（跨请求生效，供预防性剥离）。"""
+    if not names:
+        return
+    with _param_blocklist_lock:
+        blk = _param_blocklist.setdefault(real_model, set())
+        blk.update(names)
+        if len(_param_blocklist) > _PARAM_BLOCKLIST_MAX_MODELS:
+            _param_blocklist.pop(next(iter(_param_blocklist)))
+
+
+def _strip_params_from_body(sub_body: dict, names: list[str]) -> list[str]:
+    """从请求体剥离指定参数；返回实际剥离的名单。"""
+    stripped = [n for n in names if n in sub_body]
+    for n in stripped:
+        sub_body.pop(n, None)
+    return stripped
+
+
+def _chain_failure_status(last_kind: str, last_status: int | None) -> tuple[int, str, str]:
+    """把链尾最后一个候选的失败类别映射为返回给客户端的状态码/业务码。
+
+    一律返回 503 会让"请求日志里的错误码"与"客户端实际收到的"对不上
+    （例如上游超时客户端却收到 503）。映射规则：超时→504、限流→429、
+    上游5xx→502，其余（全冷却/无密钥/请求级错误）→503。
+    """
+    if last_kind == "timeout":
+        return 504, "virtual_model_upstream_timeout", "timeout_error"
+    if last_kind == "rate_limited" or last_status == 429:
+        return 429, "virtual_model_rate_limited", "rate_limit_exceeded"
+    if last_kind in ("server", "connect_timeout") or (isinstance(last_status, int) and last_status >= 500):
+        return 502, "virtual_model_upstream_error", "bad_gateway"
+    return 503, "virtual_model_all_failed", "service_unavailable"
+
+
+def _record_upstream_attempt(request: Request | None, model_ref: str, error: Exception, attempt_started: float | None = None, body: dict | None = None) -> None:
     """将受限的候选失败上下文交给中间件写入管理员日志。"""
+    # 每个候选尝试独立一行（chain_attempt），聚合失败时请求日志可直接看到各备用模型报错
+    import threading as _threading
+    _threading.Thread(
+        target=_log_chain_attempt_row, args=(request, model_ref, error, attempt_started, body), daemon=True
+    ).start()
+
     if request is None or not hasattr(request, "state"):
         return
     provider, model = _split_provider_model_ref(model_ref)
     attempts = getattr(request.state, "upstream_attempts", [])
-    if len(attempts) >= 8:
+    if len(attempts) >= 16:
         return
     status = getattr(error, "status_code", None)
     if isinstance(error, UpstreamRetryableError):
-        text, reason = _safe_error_message(str(error)), "retryable"
+        text, reason = _safe_error_message(str(error)), getattr(error, "kind", "") or "retryable"
     elif isinstance(error, UpstreamModelUnavailableError):
         text, reason = _safe_error_message(error.error_body), "model_unavailable"
     elif isinstance(error, UpstreamRequestError):
@@ -693,6 +879,101 @@ def _extract_usage_tokens(
 
 # ========== 流式请求处理 ==========
 
+def _record_committed_stream_failure(model: str) -> None:
+    """流式已提交给客户端后的中途失败：补记模型级软熔断失败。
+
+    提交后链路层早已返回、无法再走 _record_upstream_attempt；
+    反复"晚死"的候选靠这里的累计触发软熔断，减少被再次选中的概率。
+    """
+    try:
+        from app import virtual_models as _vm_csf
+        _vm_csf.record_model_failure(model)
+    except Exception:
+        logger.debug("记录提交后流式失败失败", exc_info=True)
+
+
+async def _prepend_stream_lines(head: list, source):
+    """把探测期缓冲的事件行先交给消费方，再继续透传上游流的剩余部分。"""
+    for line in head:
+        yield line
+    async for line in source:
+        yield line
+
+
+async def _probe_stream_start(source, probe_seconds: float, max_buffered_lines: int = 200):
+    """探测聚合链流式候选的"流首段"，健康才允许提交给客户端。
+
+    背景：大量聚合上游（one-api/new-api 类分销）会先返回 HTTP 200，
+    再在 SSE 流里输出 error 事件（如"无可用渠道"），或 200 后长时间不出
+    首个内容块。一旦把 200 和字节发给客户端就无法再切换模型，客户端只会
+    看到中途的 upstream_stream_error。因此在提交前缓冲并检查前几个事件：
+
+    - 看到 choices 内容/角色块 → 健康，返回 (已缓冲行, None)；
+    - 看到 error 事件 / 裸错误 JSON → 返回 (缓冲行, (错误摘要, "upstream_error"))；
+    - 流未输出任何内容即结束 → 返回 (缓冲行, (摘要, "empty"))；
+    - probe_seconds 内没有任何事件 → 返回 (缓冲行, (摘要, "timeout"))；
+    - 缓冲超过 max_buffered_lines 行仍未判定 → 视为健康直接提交（兜底防失控）。
+
+    返回后 source 已被部分消费：健康时调用方须用 _prepend_stream_lines
+    把缓冲行拼回流的开头再交给生成器。
+    """
+    buffered: list = []
+    deadline = time.time() + probe_seconds
+    while True:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            return buffered, (f"探测期内未收到首个流事件（等待{probe_seconds:.0f}s）", "timeout")
+        try:
+            line = await asyncio.wait_for(anext(source), timeout=remaining)
+        except StopAsyncIteration:
+            return buffered, ("上游流未输出任何内容即结束（空流）", "empty")
+        except asyncio.TimeoutError:
+            return buffered, (f"探测期内未收到首个流事件（等待{probe_seconds:.0f}s）", "timeout")
+        except httpx.TimeoutException:
+            return buffered, ("上游流读取超时", "timeout")
+        except (httpx.NetworkError, httpx.RemoteProtocolError):
+            return buffered, ("上游流连接中断", "network")
+
+        buffered.append(line)
+        stripped = line.strip()
+        if not stripped or stripped.startswith(":"):
+            continue  # 空行/SSE注释（keepalive）
+        if stripped.startswith("{") and stripped.endswith("}"):
+            # 上游直接吐裸 JSON 错误
+            try:
+                obj = json.loads(stripped)
+            except json.JSONDecodeError:
+                continue
+            if "error" in obj or "detail" in obj:
+                err_val = obj.get("error") or obj.get("detail")
+                return buffered, (_safe_error_message(err_val), "upstream_error")
+            continue
+        if stripped.startswith("data:"):
+            payload = stripped[5:].strip()
+            if payload == "[DONE]":
+                return buffered, ("上游流未输出任何内容即结束（[DONE]）", "empty")
+            try:
+                data = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(data, dict) and "error" in data:
+                return buffered, (_safe_error_message(data["error"]), "upstream_error")
+            if isinstance(data, dict) and data.get("choices"):
+                # 必须看到真实内容（文本/推理/工具调用）才算健康：
+                # 聚合上游常先发标准角色块（delta:{"role":"assistant"}）再挂起或报错，
+                # 仅凭 choices 存在就提交会让客户端挂到流式空闲超时才失败。
+                c = data["choices"][0]
+                delta = (c.get("delta") if isinstance(c, dict) else {}) or {}
+                if (delta.get("content") or delta.get("reasoning_content")
+                        or delta.get("reasoning") or delta.get("tool_calls")
+                        or delta.get("function_call") or delta.get("text")):
+                    return buffered, None  # 健康：真实内容块
+            continue
+        # 其余（event:/id:/字段行等）继续缓冲
+        if len(buffered) >= max_buffered_lines:
+            return buffered, None
+
+
 async def _handle_stream_request(
     scheduler, client_id, key_id, model,
     upstream_url, headers, body, timeout, start_time, request, in_chain=False,
@@ -719,16 +1000,36 @@ async def _handle_stream_request(
         "POST", upstream_url, headers=headers, json=body,
         timeout=httpx.Timeout(600.0, connect=30.0),
     )
+    # 聚合链内候选：用链层给的 timeout 封顶"等到响应头"的等待（非末位候选=候选预算，
+    # 末位候选=完整模型超时），防止挂死的候选拖住整链切换。流式体阶段的空闲控制
+    # 仍由 stream_generator 的 per-chunk 逻辑负责，不受此预算影响。
+    send_deadline = max(1.0, float(timeout)) if in_chain else None
     try:
-        resp = await pool.send(req, stream=True)
+        if send_deadline is not None:
+            resp = await asyncio.wait_for(pool.send(req, stream=True), timeout=send_deadline)
+        else:
+            resp = await pool.send(req, stream=True)
+    except asyncio.TimeoutError:
+        rt = time.time() - start_time
+        scheduler.record_response(key_id, model, False, rt, 0, "timeout")
+        scheduler.trigger_hard_cooldown(key_id, model, "timeout")
+        raise UpstreamRetryableError(
+            f"candidate_headers_timeout: no response headers within {send_deadline:.0f}s",
+            kind="timeout",
+        )
+    except httpx.ConnectTimeout as exc:
+        # 连接建立超时（上限30s）：等待成本低，保留换 key 重试价值
+        scheduler.record_response(key_id, model, False, time.time() - start_time, 0, "timeout")
+        scheduler.trigger_hard_cooldown(key_id, model, "timeout")
+        raise UpstreamRetryableError("upstream_connect_timeout", kind="connect_timeout") from exc
     except httpx.TimeoutException:
         scheduler.record_response(key_id, model, False, time.time() - start_time, 0, "timeout")
         scheduler.trigger_hard_cooldown(key_id, model, "timeout")
-        raise UpstreamRetryableError("upstream_timeout")
+        raise UpstreamRetryableError("upstream_timeout", kind="timeout")
     except (httpx.NetworkError, httpx.RemoteProtocolError) as exc:
         scheduler.record_response(key_id, model, False, time.time() - start_time, 0, "conn_error")
         scheduler.trigger_isolation(key_id, model, "conn_error")
-        raise UpstreamRetryableError("upstream_network_error") from exc
+        raise UpstreamRetryableError("upstream_network_error", kind="network") from exc
 
     if resp.status_code != 200:
         # 收到响应头前可以安全重试；错误正文只用于脱敏后的诊断。
@@ -744,22 +1045,22 @@ async def _handle_stream_request(
         if resp.status_code == 429:
             scheduler.record_response(key_id, model, False, rt, 429, "429")
             scheduler.trigger_hard_cooldown(key_id, model, "429")
-            raise UpstreamRetryableError(f"upstream_429: {error_message}", status_code=429)
+            raise UpstreamRetryableError(f"upstream_429: {error_message}", status_code=429, kind="rate_limited")
         if resp.status_code >= 500:
             scheduler.record_response(key_id, model, False, rt, resp.status_code, "5xx")
             scheduler.trigger_hard_cooldown(key_id, model, "5xx")
-            raise UpstreamRetryableError(f"upstream_{resp.status_code}: {error_message}", status_code=resp.status_code)
+            raise UpstreamRetryableError(f"upstream_{resp.status_code}: {error_message}", status_code=resp.status_code, kind="server")
 
         scheduler.record_response(key_id, model, False, rt, resp.status_code, "4xx")
         if resp.status_code == 401:
-            raise UpstreamRetryableError(f"upstream_401: {error_message}", status_code=401)
+            raise UpstreamRetryableError(f"upstream_401: {error_message}", status_code=401, kind="auth")
         if resp.status_code == 403:
             lower_message = error_message.lower()
             if "model" in lower_message and any(marker in lower_message for marker in ("permission", "access", "not allowed", "无权限")) and in_chain:
                 raise UpstreamModelUnavailableError(403, error_body)
             if not any(marker in lower_message for marker in ("content", "policy", "safety", "moderation", "内容", "策略", "安全")):
                 scheduler.trigger_hard_cooldown(key_id, model, "403")
-                raise UpstreamRetryableError(f"upstream_403: {error_message}", status_code=403)
+                raise UpstreamRetryableError(f"upstream_403: {error_message}", status_code=403, kind="forbidden")
         if _is_model_not_found(resp.status_code, error_body) and in_chain:
             raise UpstreamModelUnavailableError(resp.status_code, error_body)
         if in_chain:
@@ -767,7 +1068,50 @@ async def _handle_stream_request(
         scheduler.release_client_request(client_id)
         return JSONResponse(status_code=resp.status_code, content=error_body)
 
-    # 状态码200 - 创建流式生成器（: 带keepalive和per-chunk空闲检测）
+    # 状态码200 - 聚合链候选先"探测"流首段再提交（详见 _probe_stream_start）：
+    # 聚合上游常见"先回200再在SSE里报错/长时间不出首块"，一旦先把 200 发给
+    # 客户端就无法再切换模型；探测发现异常则静默关闭本候选、抛可重试错误，
+    # 由链路层切换下一个候选。非链路路径保持纯透传，行为不变。
+    stream_source = resp.aiter_lines()
+    if responses_mode:
+        stream_source = translate_sse_lines(stream_source, model)
+    if in_chain:
+        from app import virtual_models as _vm_probe
+        probe_budget = min(
+            _vm_probe.CHAIN_STREAM_PROBE_SECONDS,
+            max(5.0, float(timeout) - (time.time() - start_time)),
+        )
+        buffered_head, probe_err = await _probe_stream_start(stream_source, probe_budget)
+        if probe_err is not None:
+            probe_msg, probe_kind = probe_err
+            rt = time.time() - start_time
+            if probe_kind == "timeout":
+                scheduler.record_response(key_id, model, False, rt, 0, "timeout")
+                scheduler.trigger_hard_cooldown(key_id, model, "timeout")
+            elif probe_kind == "network":
+                scheduler.record_response(key_id, model, False, rt, 0, "conn_error")
+                scheduler.trigger_isolation(key_id, model, "conn_error")
+            else:
+                fail_type = "empty_stream" if probe_kind == "empty" else "upstream_stream_error"
+                scheduler.record_response(key_id, model, False, rt, 502, fail_type)
+                scheduler.trigger_hard_cooldown(key_id, model, fail_type)
+            logger.warning(f"[聚合] {model} 流式探测失败({probe_kind}): {probe_msg}，切换下一个候选")
+            await resp.aclose()
+            raise UpstreamRetryableError(
+                f"upstream_stream_error: {probe_msg}",
+                kind=probe_kind if probe_kind in ("timeout", "network", "empty") else "upstream_error",
+            )
+        if buffered_head:
+            stream_source = _prepend_stream_lines(buffered_head, stream_source)
+
+    # 供生成器错误路径落库用：脱敏后的请求体（messages 省略），便于核对客户端参数
+    try:
+        from app.middleware import RequestLoggingMiddleware as _RLM
+        _req_body_json = _RLM._sanitize_request_body(json.dumps(body, ensure_ascii=False))[:4096]
+    except Exception:
+        _req_body_json = ""
+
+    # 创建流式生成器（: 带keepalive和per-chunk空闲检测）
     async def stream_generator():
         prompt_tokens = 0
         completion_tokens = 0
@@ -783,13 +1127,28 @@ async def _handle_stream_request(
         raw_content_chunks = 0  # 已收到的实际内容/思考chunk数
         seen_upstream_error = ""  # 捕获的上游错误信息
 
+        def _final_error_payload(err_text: str) -> str:
+            """最终错误附完整候选尝试链（控制台详情按 JSON 渲染时间线）。
+
+            流式响应已以 200 提交，中间件不再补写失败行；本行是这次请求
+            唯一的最终记录，必须自带"试过哪些候选、各自为何失败"。
+            """
+            try:
+                attempts = getattr(request.state, "upstream_attempts", [])
+                if attempts:
+                    return json.dumps(
+                        {"final": err_text[:500], "attempts": attempts[:16]},
+                        ensure_ascii=False,
+                    )
+            except Exception:
+                pass
+            return err_text
+
         try:
-            # 使用aiter_lines逐行读取，配合空闲检测
+            # 使用（探测缓冲拼接后的）行流逐行读取，配合空闲检测
             # OAuth（Responses API）上游：先把 response.* 事件逐行翻成
             # chat.completion.chunk，再走同一套透传/usage 统计/keepalive 逻辑
-            source = resp.aiter_lines()
-            if responses_mode:
-                source = translate_sse_lines(source, model)
+            source = stream_source
             async for line in source:
                 now = time.time()
 
@@ -806,6 +1165,7 @@ async def _handle_stream_request(
                     rt = now - start_time
                     scheduler.record_response(key_id, model, False, rt, 0, "timeout")
                     scheduler.trigger_hard_cooldown(key_id, model, "timeout")
+                    _record_committed_stream_failure(model)
                     error_data = {"error": {"message": "上游响应超时（空闲时间过长）",
                                             "type": "timeout_error", "code": "upstream_idle_timeout"}}
                     yield f"data: {json.dumps(error_data, ensure_ascii=False)}\n\n"
@@ -814,9 +1174,10 @@ async def _handle_stream_request(
                     await _log_request(
                         client_id, key_id, model, 504, rt,
                         prompt_tokens, completion_tokens, total_tokens, True,
-                        f"流式空闲超时(idle={idle_time:.0f}s)",
+                        _final_error_payload(f"流式空闲超时(idle={idle_time:.0f}s)"),
                         start_ts=start_time,
                         error_type="IdleTimeout", error_detail=f"空闲{idle_time:.0f}s超时",
+                        include_errors=True, request_body=_req_body_json,
                         business_code="upstream_idle_timeout",
                         request_path=str(request.url.path), http_method=request.method,
                         client_ip=get_client_ip(request), user_agent=request.headers.get("user-agent", "")[:512],
@@ -837,6 +1198,7 @@ async def _handle_stream_request(
                             if "error" in raw_obj or "detail" in raw_obj:
                                 err_val = raw_obj.get("error") or raw_obj.get("detail")
                                 seen_upstream_error = _safe_error_message(err_val)
+                                _learn_param_blocklist(model, _match_unsupported_params(seen_upstream_error))
                                 logger.warning(f"上游流式返回裸错误JSON: key={key_id[:8]} model={model}: {seen_upstream_error}")
                                 error_data = {"error": {"message": f"上游错误: {seen_upstream_error}", "type": "upstream_error", "code": "upstream_stream_error"}}
                                 yield f"data: {json.dumps(error_data, ensure_ascii=False)}\n\n"
@@ -844,11 +1206,13 @@ async def _handle_stream_request(
                                 rt = time.time() - start_time
                                 scheduler.record_response(key_id, model, False, rt, 502, "upstream_stream_error")
                                 scheduler.trigger_hard_cooldown(key_id, model, "upstream_stream_error")
+                                _record_committed_stream_failure(model)
                                 scheduler.release_client_request(client_id)
                                 await _log_request(
                                     client_id, key_id, model, 502, rt, prompt_tokens, completion_tokens, total_tokens, True,
-                                    f"上游流式错误: {seen_upstream_error}", start_ts=start_time,
+                                    _final_error_payload(f"上游流式错误: {seen_upstream_error}"), start_ts=start_time,
                                     error_type="UpstreamStreamError", error_detail=seen_upstream_error,
+                                    include_errors=True, request_body=_req_body_json,
                                     business_code="upstream_stream_error",
                                     request_path=getattr(request, 'url', None) and str(request.url.path) or "",
                                     http_method=getattr(request, 'method', ''), client_ip=get_client_ip(request),
@@ -881,6 +1245,7 @@ async def _handle_stream_request(
                             if "error" in data:
                                 err_val = data["error"]
                                 seen_upstream_error = _safe_error_message(err_val)
+                                _learn_param_blocklist(model, _match_unsupported_params(seen_upstream_error))
                                 logger.warning(f"上游流式返回data: error: key={key_id[:8]} model={model}: {seen_upstream_error}")
                                 error_data = {"error": {"message": f"上游错误: {seen_upstream_error}", "type": "upstream_error", "code": "upstream_stream_error"}}
                                 yield f"data: {json.dumps(error_data, ensure_ascii=False)}\n\n"
@@ -888,11 +1253,13 @@ async def _handle_stream_request(
                                 rt = time.time() - start_time
                                 scheduler.record_response(key_id, model, False, rt, 502, "upstream_stream_error")
                                 scheduler.trigger_hard_cooldown(key_id, model, "upstream_stream_error")
+                                _record_committed_stream_failure(model)
                                 scheduler.release_client_request(client_id)
                                 await _log_request(
                                     client_id, key_id, model, 502, rt, prompt_tokens, completion_tokens, total_tokens, True,
-                                    f"上游流式错误: {seen_upstream_error}", start_ts=start_time,
+                                    _final_error_payload(f"上游流式错误: {seen_upstream_error}"), start_ts=start_time,
                                     error_type="UpstreamStreamError", error_detail=seen_upstream_error,
+                                    include_errors=True, request_body=_req_body_json,
                                     business_code="upstream_stream_error",
                                     request_path=getattr(request, 'url', None) and str(request.url.path) or "",
                                     http_method=getattr(request, 'method', ''), client_ip=get_client_ip(request),
@@ -913,7 +1280,11 @@ async def _handle_stream_request(
                             if "choices" in data and data["choices"]:
                                 c = data["choices"][0]
                                 delta = (c.get("delta") if isinstance(c, dict) else {}) or {}
-                                if delta.get("content") or delta.get("reasoning_content") or delta.get("reasoning"):
+                                # 工具调用/文本型 delta 同样是有效内容：Agent（如 ZCode）的
+                                # 大量回合只有 tool_calls 没有文本，漏计会把合法流误判成空流
+                                if (delta.get("content") or delta.get("reasoning_content")
+                                        or delta.get("reasoning") or delta.get("tool_calls")
+                                        or delta.get("function_call") or delta.get("text")):
                                     raw_content_chunks += 1
                         except json.JSONDecodeError:
                             pass
@@ -940,12 +1311,14 @@ async def _handle_stream_request(
                 rt = time.time() - start_time
                 scheduler.record_response(key_id, model, False, rt, 502, "empty_stream")
                 scheduler.trigger_hard_cooldown(key_id, model, "empty_stream")
+                _record_committed_stream_failure(model)
                 scheduler.release_client_request(client_id)
                 await _log_request(
                     client_id, key_id, model, 502, rt,
-                    prompt_tokens, completion_tokens, total_tokens, True, err_desc,
+                    prompt_tokens, completion_tokens, total_tokens, True, _final_error_payload(err_desc),
                     start_ts=start_time,
                     error_type="EmptyStream", error_detail=err_desc,
+                        include_errors=True, request_body=_req_body_json,
                     business_code="upstream_empty_response",
                     request_path=getattr(request, 'url', None) and str(request.url.path) or "",
                     http_method=getattr(request, 'method', ''),
@@ -985,6 +1358,7 @@ async def _handle_stream_request(
             scheduler.record_response(key_id, model, False, rt, 0, "timeout")
             # 超时触发差异化冷却（15秒，不是隔离5分钟）
             scheduler.trigger_hard_cooldown(key_id, model, "timeout")
+            _record_committed_stream_failure(model)
             error_data = {"error": {"message": "上游响应超时",
                                     "type": "timeout_error", "code": "upstream_timeout"}}
             yield f"data: {json.dumps(error_data)}\n\n"
@@ -992,9 +1366,10 @@ async def _handle_stream_request(
             scheduler.release_client_request(client_id)
             # : 记录超时错误日志
             await _log_request(
-                client_id, key_id, model, 504, rt, 0, 0, 0, True, "上游响应超时",
+                client_id, key_id, model, 504, rt, 0, 0, 0, True, _final_error_payload("上游响应超时"),
                 start_ts=start_time,
                 error_type="TimeoutException", error_detail="上游响应超时",
+                include_errors=True, request_body=_req_body_json,
                 business_code="upstream_timeout",
                 request_path=str(request.url.path), http_method=request.method,
                 client_ip=get_client_ip(request), user_agent=request.headers.get("user-agent", "")[:512],
@@ -1012,6 +1387,7 @@ async def _handle_stream_request(
                 yield f"data: {json.dumps(finish_data)}\n\n"
             else:
                 scheduler.trigger_hard_cooldown(key_id, model, "timeout")
+                _record_committed_stream_failure(model)
                 # 无有效数据时发送error让客户端知道出错了，但不发送[DONE]阻止重试
                 error_data = {"error": {"message": f"流式传输中断: {str(e)}",
                                         "type": "connection_error", "code": "stream_interrupted"}}
@@ -1021,9 +1397,10 @@ async def _handle_stream_request(
             await _log_request(
                 client_id, key_id, model, 502, rt,
                 prompt_tokens, completion_tokens, total_tokens, True,
-                f"流式传输中断(已接收{chunks_received}chunks): {str(e)}",
+                _final_error_payload(f"流式传输中断(已接收{chunks_received}chunks): {str(e)}"),
                 start_ts=start_time,
                 error_type="ReadError", error_detail=str(e)[:1024],
+                include_errors=True, request_body=_req_body_json,
                 error_stack=traceback.format_exc()[:4096],
                 business_code="stream_interrupted",
                 request_path=str(request.url.path), http_method=request.method,
@@ -1039,9 +1416,10 @@ async def _handle_stream_request(
             scheduler.release_client_request(client_id)
             # : 记录流式异常日志
             await _log_request(
-                client_id, key_id, model, 500, rt, 0, 0, 0, True, f"流式传输错误: {str(e)}",
+                client_id, key_id, model, 500, rt, 0, 0, 0, True, _final_error_payload(f"流式传输错误: {str(e)}"),
                 start_ts=start_time,
                 error_type=type(e).__name__, error_detail=str(e)[:1024],
+                include_errors=True, request_body=_req_body_json,
                 error_stack=traceback.format_exc()[:4096],
                 business_code="stream_error",
                 request_path=str(request.url.path), http_method=request.method,
@@ -1103,12 +1481,12 @@ async def _handle_nonstream_request(
                 err_msg = _safe_error_message(data["error"])
                 scheduler.record_response(key_id, model, False, rt, 502, "upstream_error")
                 scheduler.trigger_hard_cooldown(key_id, model, "upstream_error")
-                raise UpstreamRetryableError(f"upstream_error: {err_msg}", status_code=502)
+                raise UpstreamRetryableError(f"upstream_error: {err_msg}", status_code=502, kind="upstream_error")
             if isinstance(data, dict) and not data.get("choices") and not data.get("id"):
                 err_msg = _safe_error_message(data) if data else "上游未返回有效choices内容"
                 scheduler.record_response(key_id, model, False, rt, 502, "empty_choices")
                 scheduler.trigger_hard_cooldown(key_id, model, "empty_choices")
-                raise UpstreamRetryableError(f"upstream_empty: {err_msg}", status_code=502)
+                raise UpstreamRetryableError(f"upstream_empty: {err_msg}", status_code=502, kind="empty")
             u = (
                 data.get("usage")
                 or (data.get("response") and isinstance(data["response"], dict) and data["response"].get("usage"))
@@ -1146,7 +1524,7 @@ async def _handle_nonstream_request(
             scheduler.record_response(key_id, model, False, rt, 429, "429")
             scheduler.trigger_hard_cooldown(key_id, model, "429")
             logger.warning(f"上游429: key={key_id[:8]} model={model} 触发桶级冷却")
-            raise UpstreamRetryableError(f"upstream_429: {error_message}", status_code=429)
+            raise UpstreamRetryableError(f"upstream_429: {error_message}", status_code=429, kind="rate_limited")
 
         elif resp.status_code >= 500:
             # 5xx - 上游瞬时故障，可换 key 或切换聚合候选。
@@ -1155,7 +1533,7 @@ async def _handle_nonstream_request(
             scheduler.record_response(key_id, model, False, rt, resp.status_code, "5xx")
             scheduler.trigger_hard_cooldown(key_id, model, "5xx")
             logger.warning(f"上游{resp.status_code}: key={key_id[:8]} model={model} 触发桶级冷却+5xx熔断检测")
-            raise UpstreamRetryableError(f"upstream_{resp.status_code}: {error_message}", status_code=resp.status_code)
+            raise UpstreamRetryableError(f"upstream_{resp.status_code}: {error_message}", status_code=resp.status_code, kind="server")
 
         else:
             error_body = _parse_upstream_error_body(resp.text)
@@ -1164,7 +1542,7 @@ async def _handle_nonstream_request(
 
             # 401 是当前上游 key 失效；403 只有明确的模型权限错误才切模型。
             if resp.status_code == 401:
-                raise UpstreamRetryableError(f"upstream_401: {error_message}", status_code=401)
+                raise UpstreamRetryableError(f"upstream_401: {error_message}", status_code=401, kind="auth")
             if resp.status_code == 403:
                 lower_message = error_message.lower()
                 if "model" in lower_message and any(marker in lower_message for marker in ("permission", "access", "not allowed", "无权限")):
@@ -1172,7 +1550,7 @@ async def _handle_nonstream_request(
                         raise UpstreamModelUnavailableError(403, error_body)
                 elif not any(marker in lower_message for marker in ("content", "policy", "safety", "moderation", "内容", "策略", "安全")):
                     scheduler.trigger_hard_cooldown(key_id, model, "403")
-                    raise UpstreamRetryableError(f"upstream_403: {error_message}", status_code=403)
+                    raise UpstreamRetryableError(f"upstream_403: {error_message}", status_code=403, kind="forbidden")
 
             if _is_model_not_found(resp.status_code, error_body) and in_chain:
                 raise UpstreamModelUnavailableError(resp.status_code, error_body)
@@ -1185,19 +1563,30 @@ async def _handle_nonstream_request(
 
     except UpstreamRetryableError:
         raise  # 重新抛出给tenacity处理
+    except httpx.ConnectTimeout as e:
+        # 连接建立超时（上限30s）：等待成本低，保留换 key 重试价值
+        rt = time.time() - start_time
+        scheduler.record_response(key_id, model, False, rt, 0, "timeout")
+        scheduler.trigger_hard_cooldown(key_id, model, "timeout")
+        logger.warning(f"上游连接超时: key={key_id[:8]} model={model} rt={rt:.1f}s")
+        raise UpstreamRetryableError(
+            f"connect_timeout: key={key_id[:8]} model={model}", kind="connect_timeout"
+        ) from e
     except httpx.TimeoutException:
         rt = time.time() - start_time
         scheduler.record_response(key_id, model, False, rt, 0, "timeout")
         # 超时只触发冷却，不触发隔离（超时可能是NVIDIA响应慢，不代表密钥故障）
         scheduler.trigger_hard_cooldown(key_id, model, "timeout")
         logger.warning(f"请求超时: key={key_id[:8]} model={model} rt={rt:.1f}s")
-        raise UpstreamRetryableError(f"timeout: key={key_id[:8]} model={model}")
+        raise UpstreamRetryableError(
+            f"timeout: key={key_id[:8]} model={model}", kind="timeout"
+        )
     except (httpx.NetworkError, httpx.RemoteProtocolError) as e:
         rt = time.time() - start_time
         scheduler.record_response(key_id, model, False, rt, 0, "conn_error")
         scheduler.trigger_isolation(key_id, model, "conn_error")
         logger.error(f"上游网络错误: key={key_id[:8]} model={model} error={e}")
-        raise UpstreamRetryableError("upstream_network_error") from e
+        raise UpstreamRetryableError("upstream_network_error", kind="network") from e
 
 
 # ========== 带重试的上游调用（聊天补全，普通单模型路径） ==========
@@ -1250,7 +1639,9 @@ async def _dispatch_once(
         # 聚合链路场景：不在此处 release（并发计数由 chain 层统一管理），
         # 直接抛 UpstreamRetryableError，让上层切到链中下一个模型。
         if in_chain:
-            raise UpstreamRetryableError(f"no_key: model={model}（该模型暂无可用密钥/熔断中）")
+            raise UpstreamRetryableError(
+                f"no_key: model={model}（该模型暂无可用密钥/熔断中）", kind="no_key"
+            )
         scheduler.release_client_request(client_id)
         # 检查是否是模型级熔断（而非真正的密钥不可用）
         now = time.time()
@@ -1330,7 +1721,7 @@ async def _dispatch_once(
                         "code": "oauth_refresh_failed",
                     })
                 # 聚合链场景：抛可重试错误，让链切换到下一个候选模型
-                raise UpstreamRetryableError(f"oauth_refresh_failed: {exc}")
+                raise UpstreamRetryableError(f"oauth_refresh_failed: {exc}", kind="oauth")
             if not access_token:
                 rt = time.time() - start_time
                 scheduler.record_response(key_id, model, False, rt, 0, "oauth_refresh_failed")
@@ -1341,7 +1732,7 @@ async def _dispatch_once(
                         "type": "oauth_refresh_failed",
                         "code": "oauth_refresh_failed",
                     })
-                raise UpstreamRetryableError("oauth_refresh_failed: 凭据信封缺失")
+                raise UpstreamRetryableError("oauth_refresh_failed: 凭据信封缺失", kind="oauth")
         else:
             # 兼容：普通 OpenAI 平台 Key 也允许直调 /responses
             access_token = api_key
@@ -1406,11 +1797,18 @@ async def _call_upstream_chain(
 ):
     """按 chain 顺序依次尝试真实模型，实现无缝故障转移。
 
+    切换速度与容错的平衡策略（配合 virtual_models 的自适应软熔断）：
+
     对每个真实模型：
     - 若该模型正处于软熔断中（近期持续失败），直接跳过；
-    - 否则在其内部做有限次（CHAIN_PER_MODEL_ATTEMPTS）换 key 重试；
+    - 否则按"错误分级"决定模型内重试次数：超时/无密钥类错误立即换下一个候选
+      （等待成本高或重选无变化），429/5xx/401 等瞬时错误保留换 key 重试机会；
+    - 链中非末位候选的等待时间封顶为 CHAIN_CANDIDATE_TIMEOUT_SECONDS（快速试错），
+      末位兜底候选保留完整模型超时（耐心等完）；
+    - 整链超过 CHAIN_TOTAL_BUDGET_SECONDS 后，仅尝试末位兜底候选；
     - 成功则记 success 并直接返回响应（流式一旦开始输出即锁定该模型）；
-    - 该模型这轮尝试全失败则记 failure（可能触发软熔断）并切下一个。
+    - 该模型这轮尝试全失败则记 failure（可能触发软熔断）并切下一个；
+      但 no_key（无可用密钥）不算模型失败——密钥冷却 ≠ 模型坏了。
 
     仅当 chain 内所有模型都失败时，才向客户端返回错误。
     并发名额：整链只在最终结束（成功返回前 / 全失败后）释放一次，
@@ -1420,35 +1818,79 @@ async def _call_upstream_chain(
 
     # 覆写请求体的 model 为当前真实模型；chat_path 沿用传入的 upstream_url 结构
     last_error = "no_candidate"
+    last_kind = ""       # 最后一个失败候选的错误分级（用于映射返回给客户端的状态码）
+    last_status = None   # 最后一个失败候选的上游状态码
     tried_any = False
     all_cooling = True
+    chain_started = dispatch_start_time if dispatch_start_time else time.time()
+    budget_exhausted_logged = False
 
-    for real_model in chain:
+    # 预取熔断快照：既用于跳过判断，也用于判断某候选后面是否还有"真正可切"的备选
+    cooling_flags = [vm.is_model_cooling(m) for m in chain]
+
+    for idx, real_model in enumerate(chain):
         # 软熔断跳过（但记录，若全部在熔断中则最后放宽重试第一个）
-        if vm.is_model_cooling(real_model):
+        if cooling_flags[idx]:
             rem = vm.cooldown_remaining(real_model)
             logger.info(f"[聚合] 跳过熔断中的模型 {real_model}（剩余 {rem:.0f}s）")
             last_error = f"model_cooling:{real_model}"
+            # 跳过类原因不覆盖真实上游错误（保留 504/429/502 的状态码保真）
+            if not last_kind:
+                last_kind = "model_cooling"
             continue
         all_cooling = False
         tried_any = True
+
+        # 整链预算：超时后跳过"还有备选"的候选，把时间留给链尾兜底模型
+        has_fallback = any(not cooling_flags[j] for j in range(idx + 1, len(chain)))
+        if has_fallback and time.time() - chain_started > vm.CHAIN_TOTAL_BUDGET_SECONDS:
+            if not budget_exhausted_logged:
+                budget_exhausted_logged = True
+                logger.warning(
+                    f"[聚合] 整链预算 {vm.CHAIN_TOTAL_BUDGET_SECONDS:.0f}s 已耗尽，"
+                    "跳过剩余非兜底候选，直接尝试链尾兜底"
+                )
+            last_error = f"chain_budget_exhausted:{real_model}"
+            if not last_kind:
+                last_kind = "chain_budget"
+            continue
 
         # 调度器使用完整引用锁定 provider；发送给上游的 model 则必须是原始模型 ID。
         _, upstream_model = _split_provider_model_ref(real_model)
         sub_body = dict(body)
         sub_body["model"] = upstream_model
         sub_body = apply_model_defaults(sub_body)
+        pre_stripped = _strip_blocked_params(real_model, sub_body)
+        if pre_stripped:
+            logger.info(f"[聚合] {real_model} 预防性剥离已知不支持参数 {pre_stripped}")
         if is_stream:
             sub_body.setdefault("stream_options", {})
             if isinstance(sub_body["stream_options"], dict):
                 sub_body["stream_options"]["include_usage"] = True
-        timeout = get_timeout_for_model(upstream_model)
+
+        # 候选超时预算：非末位候选封顶（快速试错）；末位兜底候选用完整模型超时，
+        # 但同样受整链预算约束（保底 CHAIN_FINAL_MIN_SECONDS），避免整链无限拖长、
+        # 远超客户端/中间代理的超时窗口（那会导致客户端先收到 504/524）。
+        model_timeout = get_timeout_for_model(upstream_model)
+        if has_fallback and model_timeout > vm.CHAIN_CANDIDATE_TIMEOUT_SECONDS:
+            timeout = vm.CHAIN_CANDIDATE_TIMEOUT_SECONDS
+            logger.info(
+                f"[聚合] {real_model} 为非兜底候选，单次尝试预算封顶 {timeout:.0f}s"
+                f"（模型默认超时 {model_timeout:.0f}s）"
+            )
+        elif not has_fallback:
+            remaining_budget = vm.CHAIN_TOTAL_BUDGET_SECONDS - (time.time() - chain_started)
+            timeout = min(model_timeout, max(vm.CHAIN_FINAL_MIN_SECONDS, remaining_budget))
+        else:
+            timeout = model_timeout
 
         logger.info(f"[聚合] 虚拟模型 {virtual_id} -> 尝试真实模型 {real_model}")
 
-        # 该模型内部只对瞬时/密钥级故障有限换 key；请求级错误必须终止整链。
+        # 错误分级决定该模型内的重试次数（见 virtual_models.chain_attempts_for_kind）；
+        # 请求级错误必须终止整链。
         model_failed = False
         for attempt in range(vm.CHAIN_PER_MODEL_ATTEMPTS):
+            attempt_started = time.time()
             try:
                 resp = await _dispatch_once(
                     scheduler, client_id, real_model, base_upstream_url, sub_body,
@@ -1459,7 +1901,17 @@ async def _call_upstream_chain(
                 logger.info(f"[聚合] 真实模型 {real_model} 命中，返回响应")
                 return resp
             except UpstreamRequestError as e:
-                _record_upstream_attempt(request, real_model, e)
+                _record_upstream_attempt(request, real_model, e, attempt_started, sub_body)
+                # 参数不被该上游接受（HTTP 400 形式）：剥离后原地重试并学习
+                param_names = _match_unsupported_params(_safe_error_message(e.error_body))
+                if param_names:
+                    _learn_param_blocklist(real_model, param_names)
+                    stripped = _strip_params_from_body(sub_body, param_names)
+                    if stripped:
+                        last_error = _safe_error_message(e.error_body)
+                        logger.warning(f"[聚合] {real_model} 不支持参数 {stripped}，已剥离后原地重试")
+                        continue
+                last_kind, last_status = "request_error", e.status_code
                 if _should_failover_after_request_error(e):
                     last_error = _safe_error_message(e.error_body)
                     model_failed = True
@@ -1472,24 +1924,57 @@ async def _call_upstream_chain(
                 # 参数、上下文、内容策略等拒绝与候选无关，保留原上游状态即可。
                 return JSONResponse(status_code=e.status_code, content=e.error_body)
             except UpstreamModelUnavailableError as e:
-                _record_upstream_attempt(request, real_model, e)
+                _record_upstream_attempt(request, real_model, e, attempt_started, sub_body)
                 last_error = _safe_error_message(e.error_body)
+                last_kind, last_status = "model_unavailable", e.status_code
                 model_failed = True
                 logger.warning(f"[聚合] {real_model} 模型不可用，切换下一个候选")
                 break
             except UpstreamRetryableError as e:
-                _record_upstream_attempt(request, real_model, e)
+                _record_upstream_attempt(request, real_model, e, attempt_started, sub_body)
                 last_error = _safe_error_message(str(e))
+                kind = getattr(e, "kind", "") or "upstream_error"
+                # 参数不被该上游接受（可能以 200+SSE 流内错误形式出现，而非 HTTP 400）：
+                # 同样剥离后原地重试并学习——否则每个候选都会带着同样的坏参数全灭
+                param_names = _match_unsupported_params(last_error)
+                if param_names:
+                    _learn_param_blocklist(real_model, param_names)
+                    stripped = _strip_params_from_body(sub_body, param_names)
+                    if stripped:
+                        model_failed = True
+                        logger.warning(f"[聚合] {real_model} 不支持参数 {stripped}（{kind}），已剥离后原地重试")
+                        continue
+                if kind == "no_key":
+                    # 该模型当前没有可用密钥（密钥级冷却/无密钥）：立刻重选结果不变，
+                    # 且"密钥暂时不可用"不应记成"模型故障"，直接换下一个候选；
+                    # 也不覆盖前面候选的真实上游错误（状态码保真）。
+                    logger.info(f"[聚合] {real_model} 暂无可用密钥，直接切换下一个候选")
+                    break
+                last_kind, last_status = kind, e.status_code
+                if attempt + 1 >= vm.chain_attempts_for_kind(kind):
+                    model_failed = True
+                    if kind == "timeout":
+                        logger.warning(
+                            f"[聚合] {real_model} 等待超时，按策略不再对同一模型重试"
+                            "（再等一轮只会更慢），立即切换下一个候选"
+                        )
+                    else:
+                        logger.warning(f"[聚合] {real_model} {kind}失败: {last_error}，切换下一个候选")
+                    break
                 model_failed = True
-                logger.warning(f"[聚合] {real_model} 第{attempt+1}次瞬时失败: {last_error}")
+                logger.warning(
+                    f"[聚合] {real_model} 第{attempt + 1}次瞬时失败({kind}): {last_error}，换 key 重试"
+                )
                 continue
             except HTTPException as e:
                 last_error = (e.detail.get("message") if isinstance(e.detail, dict) else str(e.detail)) or "http_error"
+                last_kind, last_status = "http_error", e.status_code
                 model_failed = True
                 logger.warning(f"[聚合] {real_model} 返回 HTTP {e.status_code}，切换下一个候选")
                 break
 
-        # 只有模型不可用或真实瞬时故障才进入聚合软熔断；请求级错误已在上方返回。
+        # 只有模型不可用或真实瞬时故障才进入聚合软熔断；
+        # 请求级错误已在上方返回，no_key 不计入（避免误伤健康模型）。
         if model_failed:
             vm.record_model_failure(real_model)
 
@@ -1506,6 +1991,7 @@ async def _call_upstream_chain(
             if isinstance(sub_body["stream_options"], dict):
                 sub_body["stream_options"]["include_usage"] = True
         timeout = get_timeout_for_model(upstream_model)
+        attempt_started = time.time()
         try:
             resp = await _dispatch_once(
                 scheduler, client_id, forced, base_upstream_url, sub_body,
@@ -1515,20 +2001,25 @@ async def _call_upstream_chain(
             vm.record_model_success(forced)
             return resp
         except UpstreamRequestError as e:
-            _record_upstream_attempt(request, forced, e)
+            _record_upstream_attempt(request, forced, e, attempt_started, sub_body)
             scheduler.release_client_request(client_id)
             return JSONResponse(status_code=e.status_code, content=e.error_body)
         except (UpstreamRetryableError, UpstreamModelUnavailableError, HTTPException) as e:
-            _record_upstream_attempt(request, forced, e)
+            _record_upstream_attempt(request, forced, e, attempt_started, sub_body)
             last_error = str(e.detail if isinstance(e, HTTPException) else e)
+            last_kind = getattr(e, "kind", "") or ("http_error" if isinstance(e, HTTPException) else last_kind)
+            last_status = getattr(e, "status_code", None)
 
-    # 全链失败：释放并发名额，向客户端返回错误
+    # 全链失败：释放并发名额，向客户端返回错误。
+    # 状态码按最后一个候选的失败类别映射（而非一律 503），
+    # 保证请求日志与客户端实际收到的一致：超时→504、限流→429、上游5xx→502。
     scheduler.release_client_request(client_id)
-    logger.error(f"[聚合] 虚拟模型 {virtual_id} 全链失败: {last_error}")
-    raise HTTPException(status_code=503, detail={
+    fail_status, fail_code, fail_type = _chain_failure_status(last_kind, last_status)
+    logger.error(f"[聚合] 虚拟模型 {virtual_id} 全链失败({fail_status}): {last_error}")
+    raise HTTPException(status_code=fail_status, detail={
         "message": f"聚合模型 '{virtual_id}' 的所有备选模型当前均不可用，请稍后重试。",
-        "type": "service_unavailable",
-        "code": "virtual_model_all_failed",
+        "type": fail_type,
+        "code": fail_code,
         "last_error": str(last_error)[:200],
     })
 
@@ -1570,8 +2061,19 @@ async def chat_completions(request: Request):
                     _auth_client_id = _key_row["client_id"]
             except Exception:
                 pass
+        # 认证失败的日志行也尽量带上请求的模型名（从请求体解析），便于定位是哪个模型调用被拒
+        _auth_model = ""
+        _auth_body_sniff = ""
+        if request.method == "POST":
+            try:
+                _auth_body = await request.json()
+                if isinstance(_auth_body, dict):
+                    _auth_model = str(_auth_body.get("model", "") or "")[:200]
+                    _auth_body_sniff = json.dumps(_auth_body, ensure_ascii=False)[:4096]
+            except Exception:
+                pass
         await _log_request(
-            client_id=_auth_client_id, key_id="", model="", status_code=e.status_code, rt=0,
+            client_id=_auth_client_id, key_id="", model=_auth_model, status_code=e.status_code, rt=0,
             prompt_tokens=0, completion_tokens=0, total_tokens=0,
             is_stream=False, error_msg="API密钥无效或已被禁用",
             error_type="AuthenticationError",
@@ -1581,6 +2083,7 @@ async def chat_completions(request: Request):
             http_method=request.method,
             client_ip=get_client_ip(request),
             user_agent=request.headers.get("user-agent", "")[:512],
+            request_body=_auth_body_sniff,
         )
         raise
 
@@ -1610,6 +2113,7 @@ async def chat_completions(request: Request):
     # 中间件不依赖被截断的原始请求体解析模型；失败日志也可关联虚拟模型。
     request.state.log_model = model
     request.state.log_is_stream = bool(body.get("stream"))
+    request.state.log_client_id = client_id
     request.state.upstream_attempts = []
 
     if not model:
@@ -1834,9 +2338,16 @@ def _log_request_sync(
     gateway_dispatch_ms: float = 0.0,
     cached_tokens: int = 0,
     cache_write_tokens: int = 0,
+    include_errors: bool = False,
+    force_log_category: str = "",
 ):
-    """记录日志到数据库"""
-    if status_code >= 400:
+    """记录日志到数据库
+
+    默认只写成功日志（>=400 的失败请求由中间件统一记录）。
+    include_errors=True 供聚合链候选尝试日志（chain_attempt）使用，
+    用 force_log_category 指定分类，避免失败行被吞掉。
+    """
+    if status_code >= 400 and not include_errors:
         return
 
     if gateway_dispatch_ms == 0.0:
@@ -1862,11 +2373,14 @@ def _log_request_sync(
             started_at = start_dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{start_dt.microsecond // 1000:03d}+08:00"
             completed_at = end_dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{end_dt.microsecond // 1000:03d}+08:00"
 
-        log_category = "normal"
-        if status_code == 401:
-            log_category = "auth_fail"
-        elif status_code == 403 or status_code >= 400 or status_code == 0:
-            log_category = "error"
+        if force_log_category:
+            log_category = force_log_category
+        else:
+            log_category = "normal"
+            if status_code == 401:
+                log_category = "auth_fail"
+            elif status_code == 403 or status_code >= 400 or status_code == 0:
+                log_category = "error"
 
         # 计算请求成本与货币
         cost = 0.0
@@ -1979,12 +2493,12 @@ async def _call_upstream_embeddings(scheduler, client_id, model, url, body):
             scheduler.record_response(key_id, model, False, rt, 429, "429")
             scheduler.trigger_hard_cooldown(key_id, model, "429")
             logger.warning(f"embeddings上游429: key={key_id[:8]} model={model}")
-            raise UpstreamRetryableError(f"429: key={key_id[:8]} model={model}")
+            raise UpstreamRetryableError(f"429: key={key_id[:8]} model={model}", kind="rate_limited")
         elif resp.status_code >= 500:
             # 5xx - 记录并切换密钥重试
             scheduler.record_response(key_id, model, False, rt, resp.status_code, "5xx")
             logger.warning(f"embeddings上游{resp.status_code}: key={key_id[:8]} model={model}")
-            raise UpstreamRetryableError(f"{resp.status_code}: key={key_id[:8]} model={model}")
+            raise UpstreamRetryableError(f"{resp.status_code}: key={key_id[:8]} model={model}", kind="server")
         else:
             # 4xx（非429）- 直接返回错误
             scheduler.record_response(key_id, model, False, rt, resp.status_code, "4xx")
@@ -2001,7 +2515,7 @@ async def _call_upstream_embeddings(scheduler, client_id, model, url, body):
         scheduler.record_response(key_id, model, False, rt, 0, "conn_error")
         scheduler.trigger_isolation(key_id, model, "conn_error")
         logger.warning(f"embeddings连接错误: key={key_id[:8]} model={model} error={e}")
-        raise UpstreamRetryableError(f"conn_error: key={key_id[:8]} model={model}")
+        raise UpstreamRetryableError(f"conn_error: key={key_id[:8]} model={model}", kind="network")
     except Exception as e:
         rt = time.time() - start_time
         scheduler.record_response(key_id, model, False, rt, 0, "error")

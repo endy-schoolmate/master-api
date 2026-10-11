@@ -53,6 +53,11 @@ logger = logging.getLogger("acu.admin")
 
 router = APIRouter(prefix="/gw/admin")
 
+# 聚合链候选尝试日志（log_category='chain_attempt'）是同一次客户端请求的子请求：
+# 统计类查询必须排除，否则请求数/成功率/平均延迟会被链内多次尝试稀释。
+# 日志明细查询（/request-logs 列表与详情）不过滤，尝试行需要可见。
+_ATTEMPT_EXCLUDE = "(log_category IS NULL OR log_category <> 'chain_attempt')"
+
 def _load_admin_password_hash() -> str:
     """Resolve the bcrypt admin password hash from env or .env file.
 
@@ -300,7 +305,7 @@ async def dashboard(request: Request):
         "SUM(total_tokens) as total_tokens, "
         "AVG(latency_ms) as avg_latency, "
         "SUM(CASE WHEN is_stream = 1 THEN 1 ELSE 0 END) as stream_count "
-        "FROM request_logs WHERE created_at >= %s",
+        "FROM request_logs WHERE created_at >= %s AND " + _ATTEMPT_EXCLUDE,
         (today_start,),
     )
     
@@ -333,7 +338,7 @@ async def dashboard(request: Request):
         "SUM(total_tokens) as total_tokens, "
         "AVG(latency_ms) as avg_latency, "
         "SUM(CASE WHEN is_stream = 1 THEN 1 ELSE 0 END) as stream_count "
-        "FROM request_logs"
+        "FROM request_logs WHERE " + _ATTEMPT_EXCLUDE
     )
 
     # 活跃密钥和客户数
@@ -345,7 +350,7 @@ async def dashboard(request: Request):
         "SELECT model, SUM(total_tokens) as total_tokens, SUM(prompt_tokens) as prompt_tokens, "
         "SUM(completion_tokens) as completion_tokens, COUNT(*) as request_count "
         "FROM request_logs "
-        "WHERE model IS NOT NULL AND model != '' "
+        "WHERE model IS NOT NULL AND model != '' AND " + _ATTEMPT_EXCLUDE + " "
         "GROUP BY model ORDER BY total_tokens DESC",
     )
     # Top4 + 其他
@@ -370,7 +375,7 @@ async def dashboard(request: Request):
         trend = fetch_all(
             "SELECT SUBSTR(created_at, 1, 10) as date, COUNT(*) as requests, "
             "SUM(CASE WHEN status_code >= 200 AND status_code < 300 THEN 1 ELSE 0 END) as success "
-            "FROM request_logs WHERE created_at >= ? "
+            "FROM request_logs WHERE created_at >= ? AND " + _ATTEMPT_EXCLUDE + " "
             "GROUP BY SUBSTR(created_at, 1, 10) ORDER BY date",
             (seven_days_ago,),
         )
@@ -378,7 +383,7 @@ async def dashboard(request: Request):
         trend = fetch_all(
             "SELECT (created_at::timestamptz AT TIME ZONE 'Asia/Shanghai')::date as date, COUNT(*) as requests, "
             "SUM(CASE WHEN status_code >= 200 AND status_code < 300 THEN 1 ELSE 0 END) as success "
-            "FROM request_logs WHERE created_at >= %s "
+            "FROM request_logs WHERE created_at >= %s AND " + _ATTEMPT_EXCLUDE + " "
             "GROUP BY (created_at::timestamptz AT TIME ZONE 'Asia/Shanghai')::date ORDER BY date",
             (seven_days_ago,),
         )
@@ -386,7 +391,8 @@ async def dashboard(request: Request):
     # 模型分布（今日，按请求数排序，用于原有兼容）
     model_dist = fetch_all(
         "SELECT model, COUNT(*) as count FROM request_logs "
-        "WHERE created_at >= %s AND model IS NOT NULL AND model != '' GROUP BY model ORDER BY count DESC LIMIT 10",
+        "WHERE created_at >= %s AND model IS NOT NULL AND model != '' AND " + _ATTEMPT_EXCLUDE +
+        " GROUP BY model ORDER BY count DESC LIMIT 10",
         (today_start,),
     )
     # v10.0: 添加 display_name（友好名称）
@@ -1602,7 +1608,7 @@ async def client_usage(client_id: str, request: Request):
         "SELECT COUNT(*) as total, "
         "SUM(CASE WHEN status_code = 200 THEN 1 ELSE 0 END) as success, "
         "SUM(total_tokens) as tokens "
-        "FROM request_logs WHERE client_id = %s AND created_at >= %s",
+        "FROM request_logs WHERE client_id = %s AND created_at >= %s AND " + _ATTEMPT_EXCLUDE,
         (client_id, today + "T00:00:00Z"),
     )
     return stats or {"total": 0, "success": 0, "tokens": 0}
@@ -1883,7 +1889,7 @@ async def request_logs_stats_summary(request: Request):
         """SELECT COUNT(*) as total_requests,
                   SUM(CASE WHEN status_code >= 200 AND status_code < 300 THEN 1 ELSE 0 END) as success_count,
                   AVG(latency_ms) as avg_latency
-           FROM request_logs WHERE created_at >= %s""",
+           FROM request_logs WHERE created_at >= %s AND (log_category IS NULL OR log_category <> 'chain_attempt')""",
         (today_start,),
     )
     today_total = today_stats["total_requests"] or 0
@@ -1891,7 +1897,7 @@ async def request_logs_stats_summary(request: Request):
     today_success_rate = round((today_success / today_total * 100), 2) if today_total > 0 else 0
 
     # 总数统计
-    total = fetch_one("SELECT COUNT(*) as cnt FROM request_logs")["cnt"]
+    total = fetch_one("SELECT COUNT(*) as cnt FROM request_logs WHERE " + _ATTEMPT_EXCLUDE)["cnt"]
 
     # 按日志分类统计
     category_stats = fetch_all(
@@ -1900,12 +1906,12 @@ async def request_logs_stats_summary(request: Request):
 
     # 按状态码统计
     status_stats = fetch_all(
-        "SELECT status_code, COUNT(*) as cnt FROM request_logs GROUP BY status_code ORDER BY cnt DESC"
+        "SELECT status_code, COUNT(*) as cnt FROM request_logs WHERE " + _ATTEMPT_EXCLUDE + " GROUP BY status_code ORDER BY cnt DESC"
     )
 
     # 按HTTP方法统计
     method_stats = fetch_all(
-        "SELECT http_method, COUNT(*) as cnt FROM request_logs WHERE http_method != '' GROUP BY http_method"
+        "SELECT http_method, COUNT(*) as cnt FROM request_logs WHERE http_method != '' AND " + _ATTEMPT_EXCLUDE + " GROUP BY http_method"
     )
 
     # 最近24小时请求量趋势（按小时分组）
@@ -1916,7 +1922,7 @@ async def request_logs_stats_summary(request: Request):
         cutoff_utc = (datetime.utcnow() - timedelta(hours=24)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
         hourly_stats = fetch_all(
             "SELECT SUBSTR(created_at, 12, 2) as hour, COUNT(*) as cnt "
-            "FROM request_logs WHERE created_at >= ? "
+            "FROM request_logs WHERE created_at >= ? AND " + _ATTEMPT_EXCLUDE + " "
             "GROUP BY hour ORDER BY hour",
             (cutoff_utc,),
         )
@@ -1924,14 +1930,14 @@ async def request_logs_stats_summary(request: Request):
         hourly_stats = fetch_all(
             """SELECT substr(created_at, 12, 2) as hour, COUNT(*) as cnt
                FROM request_logs
-               WHERE created_at::timestamptz >= NOW() - INTERVAL '24 hours'
+               WHERE created_at::timestamptz >= NOW() - INTERVAL '24 hours' AND (log_category IS NULL OR log_category <> 'chain_attempt')
                GROUP BY hour ORDER BY hour"""
         )
 
     # Top 10 请求路径
     top_paths = fetch_all(
         """SELECT request_path, COUNT(*) as cnt FROM request_logs
-           WHERE request_path != '' GROUP BY request_path ORDER BY cnt DESC LIMIT 10"""
+           WHERE request_path != '' AND (log_category IS NULL OR log_category <> 'chain_attempt') GROUP BY request_path ORDER BY cnt DESC LIMIT 10"""
     )
 
     # Top 10 客户端（含client_name）
@@ -1940,14 +1946,14 @@ async def request_logs_stats_summary(request: Request):
                   SUM(r.total_tokens) as total_tokens, AVG(r.latency_ms) as avg_latency
            FROM request_logs r
            LEFT JOIN clients c ON r.client_id = c.id
-           WHERE r.client_id != '' AND r.client_id IS NOT NULL
+           WHERE r.client_id != '' AND r.client_id IS NOT NULL AND (r.log_category IS NULL OR r.log_category <> 'chain_attempt')
            GROUP BY r.client_id ORDER BY cnt DESC LIMIT 10"""
     )
 
     # Top 10 客户端IP
     top_ips = fetch_all(
         """SELECT client_ip, COUNT(*) as cnt FROM request_logs
-           WHERE client_ip != '' GROUP BY client_ip ORDER BY cnt DESC LIMIT 10"""
+           WHERE client_ip != '' AND (log_category IS NULL OR log_category <> 'chain_attempt') GROUP BY client_ip ORDER BY cnt DESC LIMIT 10"""
     )
 
     # 按日期统计（最近7天每日请求量）
@@ -1962,7 +1968,7 @@ async def request_logs_stats_summary(request: Request):
                       SUM(total_tokens) as total_tokens,
                       CAST(AVG(latency_ms) AS INTEGER) as avg_latency
                FROM request_logs
-               WHERE created_at >= ?
+               WHERE created_at >= ? AND (log_category IS NULL OR log_category <> 'chain_attempt')
                GROUP BY date ORDER BY date""",
             (cutoff_utc7,),
         )
@@ -1976,7 +1982,7 @@ async def request_logs_stats_summary(request: Request):
                       SUM(total_tokens) as total_tokens,
                       AVG(latency_ms)::int as avg_latency
                FROM request_logs
-               WHERE created_at::timestamptz >= NOW() - INTERVAL '7 days'
+               WHERE created_at::timestamptz >= NOW() - INTERVAL '7 days' AND (log_category IS NULL OR log_category <> 'chain_attempt')
                GROUP BY date ORDER BY date"""
         )
 
@@ -1988,7 +1994,7 @@ async def request_logs_stats_summary(request: Request):
                       SUM(total_tokens) as total_tokens,
                       COUNT(DISTINCT model) as model_count
                FROM request_logs
-               WHERE client_id != '' AND created_at >= ?
+               WHERE client_id != '' AND created_at >= ? AND (log_category IS NULL OR log_category <> 'chain_attempt')
                GROUP BY client_id ORDER BY cnt DESC LIMIT 10""",
             (cutoff_utc7,),
         )
@@ -1999,7 +2005,7 @@ async def request_logs_stats_summary(request: Request):
                       SUM(total_tokens) as total_tokens,
                       COUNT(DISTINCT model) as model_count
                FROM request_logs
-               WHERE client_id != '' AND created_at::timestamptz >= NOW() - INTERVAL '7 days'
+               WHERE client_id != '' AND created_at::timestamptz >= NOW() - INTERVAL '7 days' AND (log_category IS NULL OR log_category <> 'chain_attempt')
                GROUP BY client_id ORDER BY cnt DESC LIMIT 10"""
         )
 
@@ -2027,7 +2033,7 @@ async def request_logs_stats_summary(request: Request):
                   SUM(total_tokens) as total_tokens,
                   AVG(latency_ms) as avg_latency
            FROM request_logs
-           WHERE model != '' AND model IS NOT NULL
+           WHERE model != '' AND model IS NOT NULL AND (log_category IS NULL OR log_category <> 'chain_attempt')
            GROUP BY model ORDER BY cnt DESC LIMIT 10"""
     )
 
@@ -2043,22 +2049,22 @@ async def request_logs_stats_summary(request: Request):
                   SUM(total_tokens) as total_tokens,
                   SUM(prompt_tokens) as total_prompt_tokens,
                   SUM(completion_tokens) as total_completion_tokens
-           FROM request_logs"""
+           FROM request_logs WHERE (log_category IS NULL OR log_category <> 'chain_attempt')"""
     )
 
     # P95延迟（PG: percentile_cont / SQLite: 用 ORDER BY + LIMIT 子查询近似）
     if _is_sqlite:
         p95_row = fetch_one(
             """SELECT CAST(AVG(latency_ms) AS INTEGER) as p95_latency
-               FROM (SELECT latency_ms FROM request_logs WHERE latency_ms > 0
+               FROM (SELECT latency_ms FROM request_logs WHERE latency_ms > 0 AND (log_category IS NULL OR log_category <> 'chain_attempt')
                      ORDER BY latency_ms LIMIT 1 OFFSET (
-                       (SELECT CAST(COUNT(*)*0.95 AS INTEGER) FROM request_logs WHERE latency_ms > 0)
+                       (SELECT CAST(COUNT(*)*0.95 AS INTEGER) FROM request_logs WHERE latency_ms > 0 AND (log_category IS NULL OR log_category <> 'chain_attempt'))
                      ))"""
         )
     else:
         p95_row = fetch_one(
             """SELECT percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms) as p95_latency
-               FROM request_logs WHERE latency_ms > 0"""
+               FROM request_logs WHERE latency_ms > 0 AND (log_category IS NULL OR log_category <> 'chain_attempt')"""
         )
 
     # 最近10条错误日志（实时追踪）
@@ -2375,6 +2381,7 @@ async def get_latency_distribution(request: Request, model: str = Query(None)):
             FROM request_logs
             WHERE created_at >= %s
             AND latency_ms > 0
+            AND (log_category IS NULL OR log_category <> 'chain_attempt')
             { 'AND model = %s' if model else '' }
         )
         GROUP BY model
@@ -2417,6 +2424,7 @@ async def get_error_analysis(request: Request, period: str = Query("day", patter
         FROM request_logs 
         WHERE created_at >= %s
         AND status_code >= 400
+        AND (log_category IS NULL OR log_category <> 'chain_attempt')
         GROUP BY error_category
         ORDER BY count DESC
     """, (cutoff,))
@@ -2432,6 +2440,7 @@ async def get_error_analysis(request: Request, period: str = Query("day", patter
         FROM request_logs 
         WHERE created_at >= %s
         AND status_code >= 400
+        AND (log_category IS NULL OR log_category <> 'chain_attempt')
         GROUP BY time_bucket
         ORDER BY time_bucket
         LIMIT 168
@@ -2472,6 +2481,7 @@ async def get_request_trend(request: Request, period: str = Query("day", pattern
             COALESCE(SUM(completion_tokens), 0) as completion_tokens
         FROM request_logs 
         WHERE created_at >= %s
+        AND (log_category IS NULL OR log_category <> 'chain_attempt')
         GROUP BY time_bucket
         ORDER BY time_bucket
     """, (fmt, cutoff))
