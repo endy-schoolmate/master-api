@@ -728,7 +728,8 @@ async function api(path, options = {}) {
   const headers = { 'Content-Type': 'application/json', ...(options.headers || {}) };
   if (S.token) headers['Authorization'] = 'Bearer ' + S.token;
   const resp = await fetch(A + path, { ...options, headers, credentials: 'same-origin' });
-  if (resp.status === 401) { S.token = ''; localStorage.removeItem('t'); render(); throw new Error('unauth'); }
+  // 401 时先清登录态；render 延迟到调用方 catch 覆盖内容之后执行，保证最终显示登录页而非报错
+  if (resp.status === 401) { S.token = ''; localStorage.removeItem('t'); setTimeout(render, 0); throw new Error('unauth'); }
   let data = null;
   try { data = await resp.json(); } catch (e) { /* 非 JSON 错误体走下面的兜底文案 */ }
   if (!resp.ok) {
@@ -761,12 +762,20 @@ function pagination(page, total, totalPages, cb) {
 }
 
 /* --- Navigation --- */
-function nav(p) {
+// 页面状态同步到 URL hash（#/logs 这种）：刷新后停留在当前页，前进/后退也可切换页面
+function pgFromHash() {
+  const h = (location.hash || '').replace(/^#\/?/, '');
+  return PN.includes(h) ? h : 'dash';
+}
+
+function nav(p, viaHash) {
   if (!p) p = 'dash';
   if (!PN.includes(p)) p = 'dash';
+  if (!viaHash && '#/' + p !== location.hash) { location.hash = '/' + p; return; }
   S.pg = p;
   render();
 }
+window.addEventListener('hashchange', function() { nav(pgFromHash(), true); });
 
 function renderNav() {
   const sidebar = document.getElementById('sidebarNav');
@@ -2918,6 +2927,8 @@ function formatLatency(ms) {
 
 /* --- Init --- */
 document.addEventListener('DOMContentLoaded', function() {
+  S.pg = pgFromHash();
+  if (location.hash && '#/' + S.pg !== location.hash) history.replaceState(null, '', '#/' + S.pg);
   render();
 });
 
