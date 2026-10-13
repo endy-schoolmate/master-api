@@ -514,6 +514,8 @@ tr:hover td { background: var(--accent-soft); }
 .msg-error { margin-top: 8px; font-size: 13px; color: var(--danger); background: var(--danger-soft, rgba(240,68,56,.1)); border: 1px solid color-mix(in srgb, var(--danger) 35%, transparent); border-radius: 10px; padding: 9px 13px; display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .msg-error.is-warning { color: #d97706; background: rgba(245, 158, 11, 0.12); border-color: rgba(245, 158, 11, 0.35); }
 html[data-theme="dark"] .msg-error.is-warning { color: #fbbf24; background: rgba(245, 158, 11, 0.15); border-color: rgba(245, 158, 11, 0.4); }
+.msg-error.is-stopped { color: var(--text-sec); background: var(--bg-card-2); border-color: var(--border); }
+.msg-error.is-stopped .msg-retry-btn { border-color: var(--border); }
 .msg-error-text { flex: 1; min-width: 0; word-break: break-word; line-height: 1.5; }
 .msg-retry-btn { border: 1px solid color-mix(in srgb, var(--danger) 45%, transparent); background: var(--bg-card); color: var(--text); font-size: 12px; cursor: pointer; padding: 4px 10px; border-radius: 8px; display: inline-flex; align-items: center; gap: 5px; flex-shrink: 0; font-weight: 500; transition: background .15s, border-color .15s, transform .08s ease; }
 .msg-retry-btn:hover { background: var(--accent-soft); border-color: var(--accent); color: var(--text); }
@@ -599,12 +601,15 @@ html[data-theme="dark"] .msg-error.is-warning { color: #fbbf24; background: rgba
 .chat-tool-btn { width: 32px; height: 32px; border-radius: 10px; border: 1px solid transparent; background: transparent; color: var(--text-sec); cursor: pointer; display: inline-flex; align-items: center; justify-content: center; transition: background .13s, color .13s; }
 .chat-tool-btn:hover { background: var(--accent-soft); color: var(--text); }
 .chat-tool-btn svg { width: 17px; height: 17px; }
-.chat-send-btn { margin-left: 6px; width: 36px; height: 36px; border-radius: 12px; border: none; background: var(--accent); color: var(--accent-contrast); cursor: pointer; display: inline-flex; align-items: center; justify-content: center; transition: opacity .15s, transform .08s ease, background .15s; flex-shrink: 0; }
+.chat-send-btn { margin-left: 6px; width: 36px; height: 36px; border-radius: 12px; border: none; background: var(--accent); color: var(--accent-contrast); cursor: pointer; display: inline-flex; align-items: center; justify-content: center; transition: opacity .15s, transform .08s ease, background .15s, filter .15s; flex-shrink: 0; }
 .chat-send-btn:hover { background: var(--accent-hover); }
 .chat-send-btn:active { transform: scale(.92); background: var(--accent-press); }
-.chat-send-btn:disabled { opacity: .35; cursor: not-allowed; }
+.chat-send-btn:disabled, .chat-send-btn.is-empty { opacity: .28; cursor: not-allowed; filter: grayscale(0.6); }
+.chat-send-btn.is-empty:hover { background: var(--accent); transform: none; opacity: .28; }
+.chat-send-btn.is-empty:active { transform: none; }
 .chat-send-btn svg { width: 17px; height: 17px; }
-.chat-send-btn.stop { background: var(--text); color: var(--bg); }
+.chat-send-btn.stop { background: var(--text); color: var(--bg); opacity: 1; filter: none; cursor: pointer; }
+.chat-send-btn.stop:hover { background: var(--text-sec); }
 .chat-hint { text-align: center; font-size: 11px; color: var(--text-dim); margin-top: 8px; }
 @keyframes chatCursorBlink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
 .stream-cursor { display: inline-block; width: 7px; height: 15px; background: var(--text); vertical-align: text-bottom; margin-left: 2px; animation: chatCursorBlink .9s infinite; border-radius: 2px; }
@@ -1094,11 +1099,18 @@ R.keys = async function() {
 
 /* ---- 上游供应商表单（名称 / Base URL / API Key / API格式 / 模型列表 / 测试连通性） ---- */
 
+// Base URL 清洗：去除末尾斜杠；若误填了完整端点（如 /chat/completions 等），自动剥离保留基础路径（如 /v1）
+function _cleanBaseUrl(raw) {
+  let u = (raw || '').trim().replace(/\/+$/, '');
+  u = u.replace(/\/(?:chat\/completions|responses|messages|models)\/?$/i, '').replace(/\/+$/, '');
+  return u;
+}
+
 // API 格式下拉（这里的 value 会作为 provider 的一个标识写入；三家都是 OpenAI 兼容的 /models 探测）
 const UPSTREAM_FORMATS = [
-  { value: 'openai',           label: 'OpenAI Chat (/v1/chat/completions)' },
-  { value: 'openai-responses', label: 'OpenAI Responses (/v1/responses)' },
-  { value: 'anthropic',        label: 'Anthropic Messages (/v1/messages)' },
+  { value: 'openai',           label: 'OpenAI Chat (/chat/completions)' },
+  { value: 'openai-responses', label: 'OpenAI Responses (/responses)' },
+  { value: 'anthropic',        label: 'Anthropic Messages (/messages)' },
   { value: 'gemini',           label: 'Gemini (generateContent)' }
 ];
 
@@ -1112,7 +1124,7 @@ window.upFetchModels = async function() {
   const btn = document.getElementById('up_fetch_btn');
   if (!box || !btn) return;
 
-  const baseUrl = (document.getElementById('up_baseurl').value || '').trim().replace(/\/+$/, '');
+  const baseUrl = _cleanBaseUrl(document.getElementById('up_baseurl').value);
   const apiKey  = document.getElementById('up_apikey').value.replace(/\s+/g, '');
   const fmt     = (document.getElementById('up_format').value || 'openai').toLowerCase();
   const ctx     = window._upCtx || {};
@@ -1499,7 +1511,9 @@ function upstreamFormModal(mode, k) {
       presetBlock +
       '<div style="display:grid;grid-template-columns:1fr 1fr;gap:0 16px">' +
         '<div class="form-group"><label>名称</label><input id="up_name" placeholder="如：智谱 GLM" value="' + escapeHtml(k.name || '') + '"></div>' +
-        '<div class="form-group"><label>Base URL</label><input id="up_baseurl" placeholder="https://api.example.com/v1" value="' + escapeHtml(k.base_url || '') + '"></div>' +
+        '<div class="form-group"><label>Base URL</label><input id="up_baseurl" placeholder="https://api.example.com/v1" value="' + escapeHtml(k.base_url || '') + '">' +
+          '<div class="text-sec" style="font-size:11px;margin-top:4px">通常填至版本后缀（如 /v1），端点由 API 格式自动拼接</div>' +
+        '</div>' +
         '<div class="form-group"><label>API Key</label><input id="up_apikey" type="password" autocomplete="new-password" placeholder="' + keyPlaceholder + '">' +
           (isEdit ? '<div class="text-sec" style="font-size:11px;margin-top:4px">已保存：' + escapeHtml(k.key_prefix || '••••') + '（留空则保持不变）</div>' : '') +
         '</div>' +
@@ -1567,12 +1581,23 @@ function upstreamFormModal(mode, k) {
     });
   }
 
+  // Base URL 输入框失焦时自动规范化（剥离误填的完整端点后缀）
+  const baseUrlInput = document.getElementById('up_baseurl');
+  if (baseUrlInput) {
+    baseUrlInput.addEventListener('blur', function() {
+      const cleaned = _cleanBaseUrl(this.value);
+      if (cleaned !== this.value.trim()) {
+        this.value = cleaned;
+      }
+    });
+  }
+
   function readForm() {
     const fmt = document.getElementById('up_format').value;
     const providerOverride = (document.getElementById('up_provider').value || '').trim();
     return {
       name: (document.getElementById('up_name').value || '').trim(),
-      base_url: (document.getElementById('up_baseurl').value || '').trim().replace(/\/+$/, ''),
+      base_url: _cleanBaseUrl(document.getElementById('up_baseurl').value),
       api_key: (document.getElementById('up_apikey').value || '').replace(/\s+/g, ''),
       provider: providerOverride || fmt,
       weight: parseInt(document.getElementById('up_weight').value) || 1,
@@ -3346,14 +3371,22 @@ function buildAssistantRow(m, opts) {
     '<div class="msg-assist-body"><div class="msg-meta"><span class="msg-model">Master API</span>' +
     (m.model ? '<span class="msg-time">' + escapeHtml(m.model) + (time ? ' · ' + time : '') + '</span>' : (time ? '<span class="msg-time">' + time + '</span>' : '')) +
     '</div>';
+  if (opts.streaming && !m.content && !m.reasoning && !m.error) {
+    const callTxt = (opts.task && opts.task.callingText) || '调用中…………';
+    inner += '<div class="chat-calling" id="calling-' + m.uid + '"><span class="call-shine">' + escapeHtml(callTxt) + '</span></div>';
+  }
   if (m.reasoning) {
     const thinking = opts.streaming && !m._reasoningDone;
     inner += reasoningShell(m.uid, thinking, thinking ? '正在深度思考<span class="reasoning-thinking-dot"><i></i><i></i><i></i></span>' : '已深度思考' + (m.reasoningSecs ? '（用时 ' + m.reasoningSecs + ' 秒）' : ''), escapeHtml(m.reasoning || ''));
   }
-  inner += '<div class="msg-md" id="md-' + m.uid + '">' + mdRender(m.content) + '</div>';
-  if (m.error) {
-    inner += '<div class="msg-error" id="err-' + m.uid + '">' +
-      '<span class="msg-error-text">❌ ' + escapeHtml(m.error) + '</span>' +
+  inner += '<div class="msg-md" id="md-' + m.uid + '">' + mdRender(m.content) + (opts.streaming ? '<span class="stream-cursor"></span>' : '') + '</div>';
+  if (opts.streaming && opts.task && opts.task.warnMsg) {
+    inner += '<div class="msg-error is-warning" id="err-' + m.uid + '"><span class="msg-error-text">⚠️ ' + escapeHtml(opts.task.warnMsg) + '</span></div>';
+  } else if (m.error) {
+    const isStopped = m.error === '已停止生成' || m.error.startsWith('调用已停止');
+    const icon = isStopped ? '⏹️ ' : '❌ ';
+    inner += '<div class="msg-error' + (isStopped ? ' is-stopped' : '') + '" id="err-' + m.uid + '">' +
+      '<span class="msg-error-text">' + icon + escapeHtml(m.error) + '</span>' +
       '<button class="msg-retry-btn" data-retry-uid="' + m.uid + '" title="重试">' + CHAT_ICONS.refresh + '重试</button>' +
       '</div>';
   }
@@ -3376,7 +3409,12 @@ function chatRenderMessages() {
   const inner = document.createElement('div');
   inner.className = 'chat-msgs-inner';
   CS.msgs.forEach(m => {
-    inner.appendChild(m.role === 'user' ? buildUserRow(m) : buildAssistantRow(m, {}));
+    if (m.role === 'user') {
+      inner.appendChild(buildUserRow(m));
+    } else {
+      const activeTask = CS.tasks.find(t => t.aMsg === m && !t.done);
+      inner.appendChild(buildAssistantRow(m, { streaming: !!activeTask, task: activeTask }));
+    }
   });
   box.appendChild(inner);
   box.scrollTop = box.scrollHeight;
@@ -3853,6 +3891,7 @@ function chatRenderChips() {
 
     box.appendChild(chip);
   });
+  chatUpdateSendBtn();
 }
 
 /* ---------- 构建发给 API 的 messages ---------- */
@@ -3938,6 +3977,8 @@ function chatIsRetryableError(err) {
 }
 
 function chatSetCalling(uid, text) {
+  const t = CS.tasks.find(x => x.aMsg && x.aMsg.uid === uid && !x.done);
+  if (t) t.callingText = text || '调用中…………';
   let c = document.getElementById('calling-' + uid);
   if (!c) {
     const md = document.getElementById('md-' + uid);
@@ -3951,11 +3992,18 @@ function chatSetCalling(uid, text) {
 }
 
 function chatRemoveCalling(uid) {
+  const t = CS.tasks.find(x => x.aMsg && x.aMsg.uid === uid && !x.done);
+  if (t) t.callingText = '';
   const c = document.getElementById('calling-' + uid);
   if (c) c.remove();
 }
 
 function chatRenderError(uid, errMsg, isRetrying) {
+  const t = CS.tasks.find(x => x.aMsg && x.aMsg.uid === uid && !x.done);
+  if (t) {
+    if (isRetrying) t.warnMsg = errMsg;
+    else t.warnMsg = '';
+  }
   const row = document.getElementById('row-' + uid);
   if (!row) return;
   const body = row.querySelector('.msg-assist-body');
@@ -3968,8 +4016,9 @@ function chatRenderError(uid, errMsg, isRetrying) {
     if (md) md.insertAdjacentElement('afterend', errEl);
     else body.appendChild(errEl);
   }
-  errEl.className = 'msg-error' + (isRetrying ? ' is-warning' : '');
-  const prefix = isRetrying ? '⚠️ ' : '❌ ';
+  const isStopped = !isRetrying && (errMsg === '已停止生成' || errMsg.startsWith('调用已停止'));
+  errEl.className = 'msg-error' + (isRetrying ? ' is-warning' : '') + (isStopped ? ' is-stopped' : '');
+  const prefix = isRetrying ? '⚠️ ' : (isStopped ? '⏹️ ' : '❌ ');
   let html = '<span class="msg-error-text">' + prefix + escapeHtml(errMsg) + '</span>';
   if (!isRetrying) {
     html += '<button class="msg-retry-btn" data-retry-uid="' + uid + '" title="重试">' + CHAT_ICONS.refresh + '重试</button>';
@@ -3979,6 +4028,8 @@ function chatRenderError(uid, errMsg, isRetrying) {
 }
 
 function chatClearError(uid) {
+  const t = CS.tasks.find(x => x.aMsg && x.aMsg.uid === uid && !x.done);
+  if (t) t.warnMsg = '';
   const errEl = document.getElementById('err-' + uid);
   if (errEl) errEl.remove();
 }
@@ -4099,7 +4150,7 @@ async function chatStream(messages, h, task) {
 
 /* 执行助手生成任务（含自动重试与实时报错显示） */
 async function chatRunAssistant(aMsg, sid0) {
-  const task = { sid: sid0, aMsg, abort: null, done: false, aborted: false };
+  const task = { sid: sid0, aMsg, abort: null, done: false, aborted: false, callingText: '调用中…………', warnMsg: '', lastError: null };
   CS.tasks.push(task);
   chatUpdateSendBtn();
   const startedAt = Date.now();
@@ -4181,16 +4232,17 @@ async function chatRunAssistant(aMsg, sid0) {
       const isAbort = err && (err.name === 'AbortError' || String(err.message || '').includes('abort') || task.aborted);
       if (isAbort) {
         task.aborted = true;
-        finalErr = null;
         break;
       }
       finalErr = err;
+      task.lastError = err;
       const retryable = chatIsRetryableError(err);
       // 遇到报错实时显示报错信息；若可重试且未输出正文且在重试次数内，则不打断重试
       if (retryable && attempt < MAX_RETRIES && !aMsg.content) {
         attempt++;
         const errDetail = err.message || String(err);
         const warnMsg = '第 ' + attempt + ' 次调用失败：' + errDetail + '，正在自动重试 (' + attempt + '/' + MAX_RETRIES + ')...';
+        task.warnMsg = warnMsg;
         chatRenderError(aMsg.uid, warnMsg, true);
         toast('调用遇到问题：' + errDetail + '，正在自动重试 (' + attempt + '/' + MAX_RETRIES + ')...', 'info');
         await new Promise((resolve) => {
@@ -4199,6 +4251,7 @@ async function chatRunAssistant(aMsg, sid0) {
             task.abort.signal.addEventListener('abort', () => { clearTimeout(timer); resolve(); }, { once: true });
           }
         });
+        task.warnMsg = '';
         continue;
       }
       // 不可重试、已有正文输出中途中断、或重试次数用尽
@@ -4208,14 +4261,14 @@ async function chatRunAssistant(aMsg, sid0) {
 
   if (renderTimer) { clearTimeout(renderTimer); renderTimer = null; }
   chatRemoveCalling(aMsg.uid);
+  task.callingText = '';
+  task.warnMsg = '';
   const hadReasoning = !!aMsg.reasoning;
   if (hadReasoning && !aMsg.reasoningSecs) {
     aMsg.reasoningSecs = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
   }
   aMsg._reasoningDone = true;
   task.done = true;
-  CS.tasks = CS.tasks.filter(t => t !== task);
-  chatUpdateSendBtn();
 
   const rbox = document.getElementById('reasoning-' + aMsg.uid);
   if (rbox) {
@@ -4230,17 +4283,34 @@ async function chatRunAssistant(aMsg, sid0) {
   const md = document.getElementById('md-' + aMsg.uid);
   if (md) md.innerHTML = mdRender(aMsg.content);
 
-  if (finalErr && !task.aborted) {
+  // 状态判定：区分主动停止、调用报错、响应为空等不同场景
+  if (task.aborted) {
+    const prevErr = task.lastError || finalErr;
+    if (prevErr) {
+      const errText = '调用已停止（最后报错：' + (prevErr.message || prevErr) + '）';
+      aMsg.error = errText;
+      chatRenderError(aMsg.uid, errText, false);
+      toast(errText, 'info');
+    } else if (!aMsg.content && !aMsg.reasoning) {
+      const stopText = '已停止生成';
+      aMsg.error = stopText;
+      chatRenderError(aMsg.uid, stopText, false);
+      toast('已停止生成', 'info');
+    } else {
+      aMsg.error = '';
+      chatClearError(aMsg.uid);
+    }
+  } else if (finalErr) {
     const errText = '请求失败：' + (finalErr.message || finalErr);
     aMsg.error = errText;
     chatRenderError(aMsg.uid, errText, false);
     toast(errText, 'error');
-  } else if (!finalErr && !aMsg.content && !aMsg.reasoning && !task.aborted) {
+  } else if (!aMsg.content && !aMsg.reasoning) {
     const errText = '请求失败：未收到任何回复内容（响应为空）';
     aMsg.error = errText;
     chatRenderError(aMsg.uid, errText, false);
     toast(errText, 'error');
-  } else if (!finalErr) {
+  } else {
     aMsg.error = '';
     chatClearError(aMsg.uid);
   }
@@ -4255,23 +4325,25 @@ async function chatRunAssistant(aMsg, sid0) {
     }
   }
 
-  if (aMsg.content || aMsg.reasoning) {
-    api('/chat/sessions/' + sid0 + '/messages', {
-      method: 'POST',
-      body: JSON.stringify({
-        role: 'assistant', content: aMsg.content, reasoning: aMsg.reasoning,
-        model: aMsg.model, prompt_tokens: aMsg.prompt_tokens || 0, completion_tokens: aMsg.completion_tokens || 0,
-        latency_ms: Date.now() - startedAt,
-      }),
-    }).then(() => chatLoadSessions()).catch(() => {});
-  } else if (aMsg.error) {
-    // 报错但无内容：保留气泡供查看报错与点击重试，不删除！
-  } else if (task.aborted) {
-    // 用户主动停止且没有任何内容：移除占位气泡
-    CS.msgs = CS.msgs.filter(x => x !== aMsg);
-    const r = document.getElementById('row-' + aMsg.uid);
-    if (r) r.remove();
+  // 持久化助手消息（有正文、有思考、或有报错/停止说明）
+  if (aMsg.content || aMsg.reasoning || aMsg.error) {
+    try {
+      await api('/chat/sessions/' + sid0 + '/messages', {
+        method: 'POST',
+        body: JSON.stringify({
+          role: 'assistant', content: aMsg.content || '', reasoning: aMsg.reasoning || '',
+          model: aMsg.model || '', prompt_tokens: aMsg.prompt_tokens || 0, completion_tokens: aMsg.completion_tokens || 0,
+          latency_ms: Date.now() - startedAt, error: aMsg.error || '',
+        }),
+      });
+      chatLoadSessions();
+    } catch (e) {
+      console.warn('持久化助手消息失败:', e);
+    }
   }
+
+  CS.tasks = CS.tasks.filter(t => t !== task);
+  chatUpdateSendBtn();
   if (CS.sid === sid0) chatScrollBottom();
 }
 
@@ -4285,12 +4357,13 @@ async function chatSend() {
   }
   if (CS.rewinding) { toast('正在处理编辑重发，请稍候', 'info'); return; }
   const input = document.getElementById('chatInput');
-  const text = (input.value || '').trim();
+  const text = (input && input.value ? input.value : '').trim();
   if (!text && !CS.pending.length) return;
   const atts = CS.pending.slice();
   CS.pending = [];
   if (input) { input.value = ''; autoResizeInput(); }
   chatRenderChips();
+  chatUpdateSendBtn();
   await chatDispatch(text, atts);
 }
 
@@ -4305,6 +4378,8 @@ async function chatDispatch(text, atts) {
       const s = await api('/chat/sessions', { method: 'POST', body: JSON.stringify({ title: '新对话' }) });
       CS.sid = s.id;
       CS.sessions.unshift(s);
+      const t2 = document.getElementById('chatTopTitle');
+      if (t2) t2.textContent = s.title || '';
     } catch (e) { toast('创建会话失败：' + e.message, 'error'); return; }
   }
   const sid0 = CS.sid; // 本次任务归属的会话：中途切换会话/开新对话后，回写仍落在原会话
@@ -4334,9 +4409,21 @@ function chatUpdateSendBtn() {
   const btn = document.getElementById('chatSendBtn');
   if (!btn) return;
   const busyHere = !!chatCurrentTask(); // 只反映当前会话的生成状态
-  btn.classList.toggle('stop', busyHere);
-  btn.title = busyHere ? '停止生成' : '发送';
-  btn.innerHTML = busyHere ? CHAT_ICONS.stop : CHAT_ICONS.up;
+  if (busyHere) {
+    btn.classList.remove('is-empty');
+    btn.classList.add('stop');
+    btn.title = '停止生成';
+    btn.innerHTML = CHAT_ICONS.stop;
+  } else {
+    btn.classList.remove('stop');
+    const input = document.getElementById('chatInput');
+    const hasText = !!(input && input.value && input.value.trim());
+    const hasAtts = !!(CS.pending && CS.pending.length);
+    const hasContent = hasText || hasAtts;
+    btn.classList.toggle('is-empty', !hasContent);
+    btn.title = hasContent ? '发送 (Enter)' : '请输入内容';
+    btn.innerHTML = CHAT_ICONS.up;
+  }
 }
 
 function chatAppendRow(row, forceScroll) {
@@ -4426,6 +4513,7 @@ async function chatOpenSession(sid) {
     CS.msgs = msgs.map(m => ({
       uid: 'h' + (++CS.seq), role: m.role, content: m.content || '', reasoning: m.reasoning || '',
       attachments: m.attachments || [], model: m.model || '', created_at: m.created_at,
+      error: m.error || '',
       reasoningSecs: 0, _reasoningDone: true,
     }));
     // 该会话若仍有后台生成任务，把内存中的半成品消息接回界面（流式更新按 uid 命中重建后的节点）
@@ -4497,9 +4585,11 @@ R.chat = async function() {
   document.getElementById('chatNewBtn').addEventListener('click', () => {
     // 生成中也可开新对话：进行中的任务转入后台继续，完成后回写原会话
     CS.sid = null; CS.msgs = []; CS.pending = [];
-    chatRenderMessages(); chatRenderChips(); chatRenderSessions(); chatUpdateSendBtn();
+    chatRenderMessages(); chatRenderChips(); chatRenderSessions();
     document.getElementById('chatTopTitle').textContent = '';
-    document.getElementById('chatInput').focus();
+    const ci = document.getElementById('chatInput');
+    if (ci) { ci.value = ''; autoResizeInput(); ci.focus(); }
+    chatUpdateSendBtn();
   });
   document.getElementById('chatBackBtn').addEventListener('click', () => nav('dash'));
   // 聊天板块内的主题切换（与全局 masterapi-theme 存储键一致）
@@ -4525,7 +4615,9 @@ R.chat = async function() {
   document.getElementById('chatImgInput').addEventListener('change', function() { chatAddFiles(this.files, 'image'); this.value = ''; });
   document.getElementById('chatDocInput').addEventListener('change', function() { chatAddFiles(this.files, 'doc'); this.value = ''; });
   const input = document.getElementById('chatInput');
-  input.addEventListener('input', autoResizeInput);
+  input.addEventListener('input', () => { autoResizeInput(); chatUpdateSendBtn(); });
+  input.addEventListener('keyup', chatUpdateSendBtn);
+  input.addEventListener('change', chatUpdateSendBtn);
   input.addEventListener('keydown', (ev) => {
     if (ev.key === 'Enter' && !ev.shiftKey && !ev.isComposing) { ev.preventDefault(); chatSend(); }
   });
@@ -4614,7 +4706,13 @@ R.chat = async function() {
   }
 
   chatRenderMessages();
+  chatUpdateSendBtn();
   await Promise.all([chatLoadConfig(), chatLoadSessions()]);
+  if (CS.sid) {
+    await chatOpenSession(CS.sid);
+  } else {
+    chatUpdateSendBtn();
+  }
 };
 
 // v10.0: 桶解冻

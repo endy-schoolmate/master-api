@@ -85,6 +85,14 @@ def normalize_pasted_key(raw: str) -> str:
     return re.sub(r"\s+", "", key)
 
 
+def normalize_upstream_base_url(raw: Optional[str]) -> str:
+    """清洗 Base URL：去除首尾空白与尾部斜杠，若误填了完整端点（如 /chat/completions 等）则自动剥离保留基础路径。"""
+    u = (raw or "").strip().rstrip("/")
+    if not u:
+        return ""
+    return re.sub(r"/(?:chat/completions|responses|messages|models)/?$", "", u, flags=re.IGNORECASE).rstrip("/")
+
+
 def _headers(api_key: str) -> dict[str, str]:
     # Persisted gateway keys currently use the OpenAI-compatible Bearer contract.
     # A non-library User-Agent avoids naive WAF rules that block python-httpx.
@@ -186,6 +194,8 @@ async def probe_provider(
                            error="模型引用的 provider 与密钥配置不一致")
         provider = ref_provider
     base_url = (probe.base_url or _default_base_url(provider)).rstrip("/")
+    # 剥离多余的服务端点后缀（容错处理：避免用户或调用方传入完整路径导致双重拼接）
+    base_url = re.sub(r"/(?:chat/completions|responses|messages|models)/?$", "", base_url, flags=re.IGNORECASE).rstrip("/")
     if not provider:
         return _result(ok=False, provider="", model=model or None, reason="no_provider", error="缺少 provider")
     if not base_url:

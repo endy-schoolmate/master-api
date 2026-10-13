@@ -326,6 +326,7 @@ def init_db() -> None:
                 prompt_tokens INTEGER DEFAULT 0,
                 completion_tokens INTEGER DEFAULT 0,
                 latency_ms INTEGER DEFAULT 0,
+                error TEXT DEFAULT '',
                 created_at TEXT NOT NULL,
                 FOREIGN KEY (session_id) REFERENCES chat_sessions(id) ON DELETE CASCADE
             );
@@ -339,6 +340,7 @@ def init_db() -> None:
         _migrate_upstream_keys_base_url(conn)
         _migrate_upstream_keys_health_check(conn)
         _migrate_upstream_keys_auth_type(conn)
+        _migrate_chat_messages_error(conn)
         logger.info("[SQLite] init_db 完成")
 
 def _get_column_names(conn, table_name: str) -> set:
@@ -414,6 +416,13 @@ def _migrate_upstream_keys_auth_type(conn) -> None:
     if "auth_type" not in existing:
         conn.execute("ALTER TABLE upstream_keys ADD COLUMN auth_type TEXT DEFAULT 'api_key'")
         logger.info("[SQLite] upstream_keys 增加 auth_type")
+
+def _migrate_chat_messages_error(conn) -> None:
+    """为 chat_messages 加 error 字段（持久化助手报错与停止状态，防刷新/切会话丢失）。"""
+    existing = _get_column_names(conn, "chat_messages")
+    if "error" not in existing:
+        conn.execute("ALTER TABLE chat_messages ADD COLUMN error TEXT DEFAULT ''")
+        logger.info("[SQLite] chat_messages 增加 error")
 
 def seed_defaults() -> None:
     defaults = {

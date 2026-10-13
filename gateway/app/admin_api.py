@@ -40,7 +40,7 @@ from app.public_api import _VERIFIED_WORKING_MODELS
 from app.middleware import (
     _login_rate_limiter, _admin_rate_limiter, get_client_ip,
 )
-from app.provider_probe import ProviderProbe, probe_provider, split_provider_model_ref, normalize_pasted_key
+from app.provider_probe import ProviderProbe, probe_provider, split_provider_model_ref, normalize_pasted_key, normalize_upstream_base_url
 from app.provider_presets import list_provider_presets, PRESET_SOURCE_URL, DEFAULT_CHATGPT_MODELS
 from app.responses_bridge import OAUTH_PROVIDER_ID
 from app.openai_oauth import (
@@ -919,7 +919,7 @@ async def test_upstream(key_id: str, req: UpstreamTestRequest, request: Request)
 
     result = await probe_provider(ProviderProbe(
         provider=row["provider"],
-        base_url=req.base_url if req.base_url is not None else row.get("base_url", ""),
+        base_url=normalize_upstream_base_url(req.base_url if req.base_url is not None else row.get("base_url", "")),
         api_key=api_key,
         model=req.model,
     ))
@@ -932,7 +932,7 @@ async def test_upstream(key_id: str, req: UpstreamTestRequest, request: Request)
 async def test_upstream_adhoc(req: UpstreamTestAdhocRequest, request: Request):
     """保存前的临时连通性测试；不写数据库或调度器状态。"""
     await require_admin(request)
-    base_url = (req.base_url or "").rstrip("/")
+    base_url = normalize_upstream_base_url(req.base_url)
     if not base_url:
         raise HTTPException(status_code=400, detail="缺少 base_url")
     if not base_url.startswith(("http://", "https://")):
@@ -993,12 +993,13 @@ async def create_upstream(req: UpstreamCreateRequest, request: Request):
     key_id = str(uuid.uuid4())
     now = utcnow()
 
+    clean_base_url = normalize_upstream_base_url(req.base_url)
     execute(
         "INSERT INTO upstream_keys "
         "(id, name, provider, api_key_ciphertext, key_prefix, base_url, weight, rpm_limit, switch_threshold, status, created_at, updated_at, auth_type) "
         "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'active', %s, %s, %s)",
         (key_id, req.name, req.provider, ciphertext, key_prefix,
-         req.base_url, req.weight, req.rpm_limit, req.switch_threshold, now, now,
+         clean_base_url, req.weight, req.rpm_limit, req.switch_threshold, now, now,
          "oauth" if is_oauth else "api_key"),
     )
 
@@ -1039,6 +1040,8 @@ async def update_upstream(key_id: str, req: UpstreamUpdateRequest, request: Requ
     for field in ["name", "base_url", "provider", "weight", "rpm_limit", "switch_threshold", "status"]:
         val = getattr(req, field, None)
         if val is not None:
+            if field == "base_url":
+                val = normalize_upstream_base_url(val)
             updates.append(f"{field} = %s")
             params.append(val)
 
@@ -2551,6 +2554,7 @@ class ChatMessageCreateRequest(BaseModel):
     prompt_tokens: int = 0
     completion_tokens: int = 0
     latency_ms: int = 0
+    error: str = ""                 # 错误信息或停止说明
 
 class ChatSessionTruncateRequest(BaseModel):
     keep: int                       # 保留开头 keep 条消息，其余删除（消息编辑重发/rewind 用）
@@ -2602,7 +2606,7 @@ async def chat_get_messages(session_id: str, request: Request):
         raise HTTPException(status_code=404, detail={"message": "会话不存在", "type": "not_found", "code": "session_not_found"})
     rows = fetch_all(
         "SELECT id, session_id, role, content, reasoning, attachments, model, "
-        "prompt_tokens, completion_tokens, latency_ms, created_at "
+        "prompt_tokens, completion_tokens, latency_ms, error, created_at "
         "FROM chat_messages WHERE session_id = %s ORDER BY created_at ASC, rowid ASC",
         (session_id,),
     )
@@ -2633,10 +2637,10 @@ async def chat_append_message(session_id: str, req: ChatMessageCreateRequest, re
 
     execute(
         "INSERT INTO chat_messages (id, session_id, role, content, reasoning, attachments, model, "
-        "prompt_tokens, completion_tokens, latency_ms, created_at) "
-        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+        "prompt_tokens, completion_tokens, latency_ms, error, created_at) "
+        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
         (mid, session_id, req.role, req.content or "", req.reasoning or "", attachments_json,
-         req.model or "", req.prompt_tokens or 0, req.completion_tokens or 0, req.latency_ms or 0, now),
+         req.model or "", req.prompt_tokens or 0, req.completion_tokens or 0, req.latency_ms or 0, req.error or "", now),
     )
 
     # 首条用户消息 → 用内容截断作为会话标题（前端显示为历史会话名）
