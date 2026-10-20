@@ -35,6 +35,8 @@ uvicorn.log
 *.bak-*
 temp_script*
 scratch/
+check_*.py
+gateway/check_*.py
 
 # AI assistant workspace files (may contain private conversation data)
 .zcode/

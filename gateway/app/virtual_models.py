@@ -55,23 +55,22 @@ CHAIN_PER_MODEL_ATTEMPTS = 2
 
 # 链中"非末位"候选的单次尝试预算（秒）：非流式为整个响应的读超时上限，
 # 流式为"等到响应头"的预算。末位候选不受此限制，保留完整模型超时。
-CHAIN_CANDIDATE_TIMEOUT_SECONDS = _env_float("MASTER_API_CHAIN_CANDIDATE_TIMEOUT", 60.0)
+# 对于大上下文（如 Codex 100k+ tokens），首包预填充可能耗时 60~90s，默认调大至 180s。
+CHAIN_CANDIDATE_TIMEOUT_SECONDS = _env_float("MASTER_API_CHAIN_CANDIDATE_TIMEOUT", 180.0)
 
 # 流式候选"提交前探测"窗口（秒）：200 之后先缓冲流的前几个事件再决定提交，
 # 覆盖聚合上游"先回200再在SSE里吐error"、"只发角色块后挂起"、"200后长时间
 # 不出首块"三类故障。必须等到真实内容块（文本/推理/工具调用）才提交。
 # 探测期内没等到即判失败并切换候选（不再让客户端挂到180s空闲超时）。
-CHAIN_STREAM_PROBE_SECONDS = _env_float("MASTER_API_CHAIN_STREAM_PROBE", 30.0)
+CHAIN_STREAM_PROBE_SECONDS = _env_float("MASTER_API_CHAIN_STREAM_PROBE", 45.0)
 
 # 整链尝试预算（秒）：链开始后超过该时长，剩余"还有备选"的候选直接跳过，
 # 末位兜底候选的等待也被压到剩余预算内（保底 CHAIN_FINAL_MIN_SECONDS）。
-# 默认 90s：客户端/中间代理的超时窗口通常在 60~120s，网关必须在那之前
-# 给出确定结果（成功或真实错误码），否则客户端只会看到自己的 504/524。
-CHAIN_TOTAL_BUDGET_SECONDS = _env_float("MASTER_API_CHAIN_TOTAL_BUDGET", 90.0)
+CHAIN_TOTAL_BUDGET_SECONDS = _env_float("MASTER_API_CHAIN_TOTAL_BUDGET", 360.0)
 
 # 末位兜底候选的最短等待预算（秒）：即使整链预算耗尽，也保证兜底候选
 # 至少有一次像样的尝试机会（而不是只给它 1~2s 直接判死）。
-CHAIN_FINAL_MIN_SECONDS = _env_float("MASTER_API_CHAIN_FINAL_MIN", 30.0)
+CHAIN_FINAL_MIN_SECONDS = _env_float("MASTER_API_CHAIN_FINAL_MIN", 60.0)
 
 # ---- 错误分级 → 单模型内重试次数 ----
 # timeout: 读/响应超时（上游挂起），等待成本高 → 立即切下一个候选；
@@ -82,10 +81,12 @@ CHAIN_ATTEMPTS_BY_KIND = {
     "no_key": 1,
 }
 
-# 模型级软熔断：滑动窗口时长（秒）
-FAIL_WINDOW_SECONDS = 60.0
+# 模型级软熔断：滑动窗口时长（秒，调大至600秒，适配LLM长请求场景）
+FAIL_WINDOW_SECONDS = _env_float("MASTER_API_CHAIN_FAIL_WINDOW", 600.0)
 # 窗口内失败次数达到此值 → 熔断（偶发失败低于该值不会触发任何切换惩罚）
-FAIL_THRESHOLD = 3
+FAIL_THRESHOLD = int(os.getenv("MASTER_API_CHAIN_FAIL_THRESHOLD", "3"))
+# 连续失败熔断阈值（连续失败次数达到此值立即熔断，无需等待滑动窗口）
+CONSECUTIVE_FAIL_THRESHOLD = int(os.getenv("MASTER_API_CHAIN_CONSECUTIVE_FAIL_THRESHOLD", "2"))
 # 熔断时长：首次触发的基准值，之后按连续触发次数翻倍升级，封顶 COOLDOWN_MAX_SECONDS
 COOLDOWN_BASE_SECONDS = _env_float("MASTER_API_CHAIN_COOLDOWN_BASE", 30.0)
 COOLDOWN_MAX_SECONDS = _env_float("MASTER_API_CHAIN_COOLDOWN_MAX", 300.0)
@@ -120,13 +121,17 @@ def get_virtual_models(use_cache: bool = True) -> list:
     """返回所有虚拟模型配置。
 
     每项形如：
-        {"id": "my-super", "display_name": "...", "chain": ["m1","m2"], "enabled": true}
+        {"id": "my-super", "display_name": "...", "chain": ["m1","m2"], "routing_strategy": "round-robin", "enabled": true}
     """
     now = time.time()
     with _lock:
         if use_cache and _cache["data"] is not None and _cache["expires"] > now:
             return _cache["data"]
         data = _load_raw()
+        # 确保每个虚拟模型都具有 routing_strategy 字段（默认 round-robin 轮询）
+        for item in data:
+            if isinstance(item, dict) and "routing_strategy" not in item:
+                item["routing_strategy"] = "round-robin"
         _cache["data"] = data
         _cache["expires"] = now + _cache_ttl
         return data
@@ -173,15 +178,55 @@ def get_chain(model_id: str) -> list:
     return [c for c in chain if isinstance(c, str) and c.strip()]
 
 
-# ========== 模型级软熔断状态（内存，跨请求） ==========
+def get_ordered_chain(model_id: str) -> list:
+    """根据虚拟模型的路由策略（轮询 / 优先级 / 自适应）返回本次请求应尝试的候选链顺序。
+
+    - round-robin: 平滑动态轮询（每次请求依次轮换起始模型，若故障顺延尝试链中剩余健康模型）；
+    - priority: 主备优先故障转移（严格按配置顺序从第一个健康模型开始）；
+    - adaptive: 健康感知自适应（优先按非熔断、低连续失败、低延迟排序）。
+    """
+    m = get_virtual_model(model_id)
+    if not m or not m.get("enabled", True):
+        return []
+    raw_chain = [c for c in (m.get("chain") or []) if isinstance(c, str) and c.strip()]
+    if not raw_chain:
+        return []
+
+    strategy = m.get("routing_strategy", "round-robin")
+
+    if strategy == "round-robin":
+        with _state_lock:
+            idx = _rr_counters.get(model_id, 0)
+            _rr_counters[model_id] = (idx + 1) % len(raw_chain)
+        # 将候选列表以 idx 为起点平移轮询
+        return raw_chain[idx:] + raw_chain[:idx]
+
+    elif strategy == "adaptive":
+        with _state_lock:
+            now = time.time()
+            def _model_rank(rm: str):
+                is_cooling = 1 if _cooldown_until.get(rm, 0.0) > now else 0
+                fails = _consecutive_fails.get(rm, 0)
+                return (is_cooling, fails)
+            return sorted(raw_chain, key=_model_rank)
+
+    else:
+        # 默认 priority: 严格按配置主备顺序
+        return list(raw_chain)
+
+
+# ========== 模型级软熔断与健康状态（内存，跨请求） ==========
 #
-# 状态机：健康 → (窗口内失败达阈值) → 熔断 → (到期) → 试探期 → 成功:健康 / 失败:再熔断
+# 状态机：健康 → (连续失败/严重错误/窗口累计) → 熔断 → (到期) → 试探期 → 成功:健康 / 失败:再熔断
 # 冷却时长按连续触发次数升级：base × 2^(n-1)，封顶 MAX；任何一次成功全部清零。
 
 _fail_history: dict[str, list[float]] = {}   # real_model -> [失败时间戳...]
 _cooldown_until: dict[str, float] = {}        # real_model -> 熔断截止时间戳
 _breach_count: dict[str, int] = {}            # real_model -> 连续熔断触发次数（升级用）
 _probation: set[str] = set()                  # 试探期中的模型（冷却到期后首次回归）
+_consecutive_fails: dict[str, int] = {}       # real_model -> 连续失败次数
+_last_fail_reason: dict[str, str] = {}        # real_model -> 最近一次失败原因
+_rr_counters: dict[str, int] = {}             # virtual_model_id -> 轮询指针
 _state_lock = threading.RLock()
 
 
@@ -220,38 +265,45 @@ def cooldown_remaining(real_model: str) -> float:
         return rem if rem > 0 else 0.0
 
 
-def record_model_failure(real_model: str) -> bool:
-    """记录一次真实模型失败。达到阈值（或试探期失败）则触发熔断。
+def record_model_failure(real_model: str, reason: str = "", is_severe: bool = False) -> bool:
+    """记录一次真实模型失败。达到阈值（或试探期失败、严重错误、连续失败达到阈值）则触发熔断。
 
     返回 True 表示本次触发了熔断。
     """
     now = time.time()
     with _state_lock:
-        # 试探期失败：模型还是坏的，立即再次熔断（时长升级），不走窗口累计
+        _consecutive_fails[real_model] = _consecutive_fails.get(real_model, 0) + 1
+        if reason:
+            _last_fail_reason[real_model] = str(reason)[:200]
+
+        should_trip = False
+        # 1. 试探期失败：模型还是坏的，立即再次熔断（时长升级），不走窗口累计
         if real_model in _probation:
             _probation.discard(real_model)
+            should_trip = True
+        # 2. 严重错误（如 SSLError、网络中断、503无渠道、502 stream error等）：立即熔断
+        elif is_severe:
+            should_trip = True
+        # 3. 连续失败次数达到阈值（默认 2 次）：立即熔断
+        elif _consecutive_fails[real_model] >= CONSECUTIVE_FAIL_THRESHOLD:
+            should_trip = True
+        else:
+            # 4. 滑动窗口累计
+            hist = _fail_history.setdefault(real_model, [])
+            hist.append(now)
+            cutoff = now - FAIL_WINDOW_SECONDS
+            hist[:] = [t for t in hist if t >= cutoff]
+            if len(hist) >= FAIL_THRESHOLD:
+                should_trip = True
+
+        if should_trip:
             seconds = _escalated_cooldown(real_model, now)
             _cooldown_until[real_model] = now + seconds
             _fail_history.pop(real_model, None)
             logger.warning(
-                f"虚拟模型链: 真实模型 '{real_model}' 试探失败，"
-                f"再次熔断 {seconds:.0f}s"
-            )
-            return True
-
-        hist = _fail_history.setdefault(real_model, [])
-        hist.append(now)
-        # 清理窗口外的
-        cutoff = now - FAIL_WINDOW_SECONDS
-        hist[:] = [t for t in hist if t >= cutoff]
-        if len(hist) >= FAIL_THRESHOLD:
-            seconds = _escalated_cooldown(real_model, now)
-            _cooldown_until[real_model] = now + seconds
-            hist.clear()
-            logger.warning(
-                f"虚拟模型链: 真实模型 '{real_model}' {FAIL_WINDOW_SECONDS:.0f}s 内失败达 "
-                f"{FAIL_THRESHOLD} 次，软熔断 {seconds:.0f}s"
-                f"（第 {_breach_count[real_model]} 次触发）"
+                f"虚拟模型链: 真实模型 '{real_model}' 触发软熔断 {seconds:.0f}s "
+                f"（连续失败 {_consecutive_fails[real_model]} 次, 原因={reason or 'failure'}, "
+                f"第 {_breach_count[real_model]} 次触发）"
             )
             return True
     return False
@@ -264,6 +316,8 @@ def record_model_success(real_model: str) -> None:
         _cooldown_until.pop(real_model, None)
         _breach_count.pop(real_model, None)
         _probation.discard(real_model)
+        _consecutive_fails[real_model] = 0
+        _last_fail_reason.pop(real_model, None)
 
 
 def get_cooldown_snapshot() -> dict:
@@ -277,4 +331,22 @@ def get_cooldown_snapshot() -> dict:
                 out[m] = round(rem, 1)
             else:
                 _cooldown_until.pop(m, None)
+        return out
+
+
+def get_model_health_stats() -> dict:
+    """返回所有真实模型的健康诊断状态（熔断剩余、连续失败、最近错误）。"""
+    now = time.time()
+    with _state_lock:
+        out = {}
+        all_models = set(_cooldown_until.keys()) | set(_consecutive_fails.keys()) | set(_last_fail_reason.keys())
+        for m in all_models:
+            rem = max(0.0, _cooldown_until.get(m, 0.0) - now)
+            out[m] = {
+                "cooling": rem > 0,
+                "cooldown_remaining": round(rem, 1),
+                "consecutive_fails": _consecutive_fails.get(m, 0),
+                "last_reason": _last_fail_reason.get(m, ""),
+                "probation": m in _probation,
+            }
         return out

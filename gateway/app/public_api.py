@@ -342,7 +342,7 @@ _ESSENTIAL_BODY_KEYS = {"model", "messages", "stream", "stream_options", "tools"
 
 _UNSUPPORTED_PARAM_RE = re.compile(
     r"unsupported parameter|unrecognized request argument|unknown (?:parameter|argument)"
-    r"|invalid parameter|does not support parameter|不支持参数|参数不支持",
+    r"|invalid parameter|does not support parameter|is not supported|not supported|不支持参数|参数不支持",
     re.I,
 )
 _PARAM_NAME_RE = re.compile(r"[`'\"“”]([a-zA-Z_][a-zA-Z0-9_]{0,40})[`'\"“”]|supplied:\s*([a-zA-Z_][a-zA-Z0-9_]{0,40})")
@@ -350,17 +350,63 @@ _PARAM_NAME_RE = re.compile(r"[`'\"“”]([a-zA-Z_][a-zA-Z0-9_]{0,40})[`'\"“�
 
 def _match_unsupported_params(message: str) -> list[str]:
     """从上游错误消息里解析"不被支持的参数名"列表（最多6个）。"""
-    if not _UNSUPPORTED_PARAM_RE.search(message or ""):
-        return []
     essential_lower = {k.lower() for k in _ESSENTIAL_BODY_KEYS}
     names: list[str] = []
-    for mt in _PARAM_NAME_RE.finditer(message):
+
+    # 优先尝试作为 JSON 解析，读取 param 或 error.param 字段
+    try:
+        data = json.loads(message)
+        if isinstance(data, dict):
+            p = data.get("param") or (data.get("error", {}).get("param") if isinstance(data.get("error"), dict) else None)
+            if p and isinstance(p, str) and p.lower() not in essential_lower and p not in names:
+                names.append(p)
+    except Exception:
+        pass
+
+    msg_str = str(message or "")
+    if "unexpected reasoning effort" in msg_str.lower() or "reasoning effort" in msg_str.lower():
+        if "reasoning_effort" not in names:
+            names.append("reasoning_effort")
+
+    if not names and not _UNSUPPORTED_PARAM_RE.search(msg_str):
+        return []
+
+    for mt in _PARAM_NAME_RE.finditer(msg_str):
         name = mt.group(1) or mt.group(2)
         if name and name.lower() not in essential_lower and name not in names:
             names.append(name)
         if len(names) >= 6:
             break
     return names
+
+
+def _adapt_reasoning_effort_for_provider(body: dict, provider: str = "", model_ref: str = "", base_url: str = "") -> None:
+    """自适应调整 reasoning_effort 枚举值，彻底解决 AMD / OpenAI 规范不兼容导致的 502/400 报错。
+
+    AMD / Qwen 节点仅支持: xhigh (default), medium, low（不支持 high，不支持 none/minimal）
+    OpenAI / 标准节点支持: high, medium, low, none（不支持 xhigh）
+    """
+    if "reasoning_effort" not in body:
+        return
+    val = str(body["reasoning_effort"]).strip().lower()
+    is_amd = (
+        (provider or "").lower() == "amd"
+        or "amd" in (model_ref or "").lower()
+        or "amd.com" in (base_url or "").lower()
+        or "qwen" in (model_ref or "").lower()
+    )
+    if is_amd:
+        if val in ("high", "ultra", "max", "highest", "xhigh"):
+            body["reasoning_effort"] = "xhigh"
+        elif val in ("none", "minimal", "disabled", "false"):
+            body.pop("reasoning_effort", None)
+        elif val not in ("xhigh", "medium", "low"):
+            body["reasoning_effort"] = "xhigh"
+    else:
+        if val in ("xhigh", "ultra", "max", "highest"):
+            body["reasoning_effort"] = "high"
+        elif val in ("minimal",):
+            body["reasoning_effort"] = "low"
 
 
 def _strip_blocked_params(real_model: str, sub_body: dict) -> list[str]:
@@ -484,6 +530,27 @@ def authenticate_client(request: Request) -> dict:
                 "client_status": "active",
                 "user_type": "admin",
             }
+
+    # === 本地 ChatGPT Desktop / Codex 客户端：PROXY_MANAGED / OAuth 放行 ===
+    client_ip = get_client_ip(request)
+    if (raw_token in ("PROXY_MANAGED", "") or raw_token.startswith("eyJ")) and client_ip in ("127.0.0.1", "::1", "localhost", "testclient"):
+        first_key = fetch_one(
+            "SELECT ck.id, ck.client_id, ck.status, c.name as client_name, c.status as client_status, "
+            "COALESCE(c.user_type, 'old') as user_type "
+            "FROM client_api_keys ck "
+            "JOIN clients c ON ck.client_id = c.id "
+            "WHERE ck.status = 'active' AND c.status = 'active' LIMIT 1"
+        )
+        if first_key:
+            return dict(first_key)
+        return {
+            "id": "",
+            "client_id": "codex-local",
+            "status": "active",
+            "client_name": "ChatGPT 本地桌面端",
+            "client_status": "active",
+            "user_type": "admin",
+        }
 
     # === v9.2: API Key 清洗（去除空白/换行/多余引号） ===
     cleaned_token, key_error = clean_and_validate_api_key(raw_token)
@@ -879,7 +946,7 @@ def _extract_usage_tokens(
 
 # ========== 流式请求处理 ==========
 
-def _record_committed_stream_failure(model: str) -> None:
+def _record_committed_stream_failure(model: str, reason: str = "", is_severe: bool = False) -> None:
     """流式已提交给客户端后的中途失败：补记模型级软熔断失败。
 
     提交后链路层早已返回、无法再走 _record_upstream_attempt；
@@ -887,7 +954,7 @@ def _record_committed_stream_failure(model: str) -> None:
     """
     try:
         from app import virtual_models as _vm_csf
-        _vm_csf.record_model_failure(model)
+        _vm_csf.record_model_failure(model, reason=reason, is_severe=is_severe)
     except Exception:
         logger.debug("记录提交后流式失败失败", exc_info=True)
 
@@ -1126,6 +1193,10 @@ async def _handle_stream_request(
 
         raw_content_chunks = 0  # 已收到的实际内容/思考chunk数
         seen_upstream_error = ""  # 捕获的上游错误信息
+        seen_finish_reason = None  # 记录已收到的结束原因，防止后续usage块冲掉
+        seen_done = False  # 记录是否收到[DONE]
+        from app.think_stripper import StreamThinkStripper, strip_think_tags
+        think_stripper = StreamThinkStripper()
 
         def _final_error_payload(err_text: str) -> str:
             """最终错误附完整候选尝试链（控制台详情按 JSON 渲染时间线）。
@@ -1165,11 +1236,12 @@ async def _handle_stream_request(
                     rt = now - start_time
                     scheduler.record_response(key_id, model, False, rt, 0, "timeout")
                     scheduler.trigger_hard_cooldown(key_id, model, "timeout")
-                    _record_committed_stream_failure(model)
+                    _record_committed_stream_failure(model, reason="empty_stream", is_severe=True)
                     error_data = {"error": {"message": "上游响应超时（空闲时间过长）",
                                             "type": "timeout_error", "code": "upstream_idle_timeout"}}
                     yield f"data: {json.dumps(error_data, ensure_ascii=False)}\n\n"
                     yield "data: [DONE]\n\n"
+                    seen_done = True
                     scheduler.release_client_request(client_id)
                     await _log_request(
                         client_id, key_id, model, 504, rt,
@@ -1203,10 +1275,11 @@ async def _handle_stream_request(
                                 error_data = {"error": {"message": f"上游错误: {seen_upstream_error}", "type": "upstream_error", "code": "upstream_stream_error"}}
                                 yield f"data: {json.dumps(error_data, ensure_ascii=False)}\n\n"
                                 yield "data: [DONE]\n\n"
+                                seen_done = True
                                 rt = time.time() - start_time
                                 scheduler.record_response(key_id, model, False, rt, 502, "upstream_stream_error")
                                 scheduler.trigger_hard_cooldown(key_id, model, "upstream_stream_error")
-                                _record_committed_stream_failure(model)
+                                _record_committed_stream_failure(model, reason=seen_upstream_error, is_severe=True)
                                 scheduler.release_client_request(client_id)
                                 await _log_request(
                                     client_id, key_id, model, 502, rt, prompt_tokens, completion_tokens, total_tokens, True,
@@ -1223,23 +1296,45 @@ async def _handle_stream_request(
                             pass
 
                     # 2) SSE字段行（id: / event: / retry: / ": "注释）不能单独成事件。
-                    # 上游（如 self-dploy 中转）会在流末尾单独发一行 `event: done`，
-                    # 旧实现把每个非空行都当成一个完整SSE事件转发（`event: done\n\n`），
-                    # OpenAI兼容客户端收到“有event但无data”的事件后会对空字符串做
-                    # JSON.parse，抛出 `Unexpected end of JSON input`——DSH的“本地”
-                    # 供应商因此整轮失败（PI_AI_ERROR）。
-                    # 现在把字段行挂起到下一条data行之前再一起发出；若字段行后面没有
-                    # data行（空行结束或流结束），就丢弃它，不再生成无data的事件。
                     if not line.startswith("data:"):
+                        # 过滤上游发出的非标准 event: done，防止破坏客户端默认的 message 事件通道
+                        if line.startswith("event:") and line.split(":", 1)[1].strip() == "done":
+                            continue
                         pending_sse_fields.append(line)
                         last_keepalive_time = now
                         continue
+
+                    # 解析 [DONE] 标记
+                    payload = line[5:].strip()
+                    if payload == "[DONE]":
+                        pending_sse_fields.clear()
+                        seen_done = True
+                        tail_vis, tail_rsn = think_stripper.finish()
+                        if tail_rsn:
+                            rsn_chunk = {
+                                "id": f"chatcmpl-{int(time.time())}",
+                                "object": "chat.completion.chunk",
+                                "created": int(time.time()),
+                                "model": model,
+                                "choices": [{"index": 0, "delta": {"reasoning_content": tail_rsn}, "finish_reason": None}],
+                            }
+                            yield f"data: {json.dumps(rsn_chunk, ensure_ascii=False)}\n\n"
+                        if tail_vis:
+                            vis_chunk = {
+                                "id": f"chatcmpl-{int(time.time())}",
+                                "object": "chat.completion.chunk",
+                                "created": int(time.time()),
+                                "model": model,
+                                "choices": [{"index": 0, "delta": {"content": tail_vis}, "finish_reason": seen_finish_reason or None}],
+                            }
+                            yield f"data: {json.dumps(vis_chunk, ensure_ascii=False)}\n\n"
+                        yield "data: [DONE]\n\n"
+                        break
+
                     for pending_field in pending_sse_fields:
                         yield f"{pending_field}\n"
                     pending_sse_fields.clear()
-                    # 解析usage信息与错误检测（data: 与负载之间允许没有空格）
-                    payload = line[5:].strip()
-                    if payload and payload != "[DONE]":
+                    if payload:
                         try:
                             data = json.loads(payload)
                             if "error" in data:
@@ -1250,10 +1345,11 @@ async def _handle_stream_request(
                                 error_data = {"error": {"message": f"上游错误: {seen_upstream_error}", "type": "upstream_error", "code": "upstream_stream_error"}}
                                 yield f"data: {json.dumps(error_data, ensure_ascii=False)}\n\n"
                                 yield "data: [DONE]\n\n"
+                                seen_done = True
                                 rt = time.time() - start_time
                                 scheduler.record_response(key_id, model, False, rt, 502, "upstream_stream_error")
                                 scheduler.trigger_hard_cooldown(key_id, model, "upstream_stream_error")
-                                _record_committed_stream_failure(model)
+                                _record_committed_stream_failure(model, reason=seen_upstream_error, is_severe=True)
                                 scheduler.release_client_request(client_id)
                                 await _log_request(
                                     client_id, key_id, model, 502, rt, prompt_tokens, completion_tokens, total_tokens, True,
@@ -1277,15 +1373,72 @@ async def _handle_stream_request(
                                 prompt_tokens, completion_tokens, total_tokens, cached_tokens, cache_write_tokens = _extract_usage_tokens(
                                     u, prompt_tokens, completion_tokens, total_tokens, cached_tokens, cache_write_tokens
                                 )
-                            if "choices" in data and data["choices"]:
-                                c = data["choices"][0]
-                                delta = (c.get("delta") if isinstance(c, dict) else {}) or {}
-                                # 工具调用/文本型 delta 同样是有效内容：Agent（如 ZCode）的
-                                # 大量回合只有 tool_calls 没有文本，漏计会把合法流误判成空流
-                                if (delta.get("content") or delta.get("reasoning_content")
-                                        or delta.get("reasoning") or delta.get("tool_calls")
-                                        or delta.get("function_call") or delta.get("text")):
-                                    raw_content_chunks += 1
+                            if "choices" in data:
+                                if not data["choices"]:
+                                    # AMD 等上游在流末尾发出携带 usage 但 choices: [] 的 chunk
+                                    # 规范化：注入空 choice 防止 CC Switch / Codex 下标越界或误判流异常
+                                    data["choices"] = [{"index": 0, "delta": {}, "finish_reason": seen_finish_reason or None}]
+                                    line = f"data: {json.dumps(data, ensure_ascii=False)}"
+                                    yield f"{line}\n\n"
+                                    continue
+                                else:
+                                    c = data["choices"][0]
+                                    delta = (c.get("delta") if isinstance(c, dict) else {}) or {}
+
+                                    # 剥离并提取思维链标签（<thinking>, <think>, <thought>, <reasoning>）
+                                    delta_content = delta.get("content")
+                                    rsn_to_emit = ""
+                                    if isinstance(delta_content, str) and delta_content:
+                                        vis_text, rsn_text = think_stripper.feed(delta_content)
+                                        if rsn_text:
+                                            rsn_to_emit = rsn_text
+                                        if vis_text:
+                                            delta["content"] = vis_text
+                                        else:
+                                            delta.pop("content", None)
+
+                                    # 工具调用或结束时刷新未闭合的思考缓冲（防止发起工具调用前未闭合的 <thinking> 外显）
+                                    if delta.get("tool_calls") or delta.get("function_call") or c.get("finish_reason"):
+                                        tail_vis, tail_rsn = think_stripper.finish()
+                                        if tail_rsn:
+                                            rsn_to_emit = (rsn_to_emit + tail_rsn) if rsn_to_emit else tail_rsn
+                                        if tail_vis:
+                                            existing_vis = delta.get("content") or ""
+                                            delta["content"] = existing_vis + tail_vis
+
+                                    # 如果本分块提取到了思考内容：先单独发一个 reasoning_content 分块，让 CC Switch / Codex 正常收纳至思考区
+                                    if rsn_to_emit:
+                                        rsn_chunk = {
+                                            "id": data.get("id") or f"chatcmpl-{int(time.time())}",
+                                            "object": "chat.completion.chunk",
+                                            "created": data.get("created") or int(time.time()),
+                                            "model": data.get("model") or model,
+                                            "choices": [{"index": 0, "delta": {"reasoning_content": rsn_to_emit}, "finish_reason": None}],
+                                        }
+                                        yield f"data: {json.dumps(rsn_chunk, ensure_ascii=False)}\n\n"
+                                        raw_content_chunks += 1
+
+                                    # 规范化 reasoning -> reasoning_content
+                                    if "reasoning" in delta and "reasoning_content" not in delta:
+                                        delta["reasoning_content"] = delta.pop("reasoning")
+
+                                    fr = c.get("finish_reason")
+                                    if fr:
+                                        seen_finish_reason = fr
+                                    elif seen_finish_reason:
+                                        # 避免后续 usage 块将已设定的 finish_reason 冲刷为 null
+                                        c["finish_reason"] = seen_finish_reason
+
+                                    # 若剥离后 delta 已变空且无结束标记，无需发送空 delta
+                                    if not delta and not c.get("finish_reason"):
+                                        continue
+
+                                    if (delta.get("content") or delta.get("reasoning_content")
+                                            or delta.get("reasoning") or delta.get("tool_calls")
+                                            or delta.get("function_call") or delta.get("text")):
+                                        raw_content_chunks += 1
+
+                                    line = f"data: {json.dumps(data, ensure_ascii=False)}"
                         except json.JSONDecodeError:
                             pass
                     yield f"{line}\n\n"
@@ -1300,6 +1453,27 @@ async def _handle_stream_request(
                         last_keepalive_time = now
                         logger.debug(f"流式keepalive: key={key_id[:8]} model={model}")
 
+            # 流式结束：刷新可能残留的 tail
+            tail_vis, tail_rsn = think_stripper.finish()
+            if tail_rsn:
+                rsn_chunk = {
+                    "id": f"chatcmpl-{int(time.time())}",
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": model,
+                    "choices": [{"index": 0, "delta": {"reasoning_content": tail_rsn}, "finish_reason": None}],
+                }
+                yield f"data: {json.dumps(rsn_chunk, ensure_ascii=False)}\n\n"
+            if tail_vis:
+                vis_chunk = {
+                    "id": f"chatcmpl-{int(time.time())}",
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": model,
+                    "choices": [{"index": 0, "delta": {"content": tail_vis}, "finish_reason": seen_finish_reason or None}],
+                }
+                yield f"data: {json.dumps(vis_chunk, ensure_ascii=False)}\n\n"
+
             # 流式结束：防御上游返回空流（0 个内容 chunk）
             if raw_content_chunks == 0:
                 raw_pending = " ".join([p for p in pending_sse_fields if not p.startswith(":")])
@@ -1307,11 +1481,12 @@ async def _handle_stream_request(
                 logger.warning(f"上游流式响应内容为空: key={key_id[:8]} model={model}: {err_desc}")
                 error_data = {"error": {"message": err_desc, "type": "upstream_error", "code": "upstream_empty_response"}}
                 yield f"data: {json.dumps(error_data, ensure_ascii=False)}\n\n"
-                yield "data: [DONE]\n\n"
+                if not seen_done:
+                    yield "data: [DONE]\n\n"
                 rt = time.time() - start_time
                 scheduler.record_response(key_id, model, False, rt, 502, "empty_stream")
                 scheduler.trigger_hard_cooldown(key_id, model, "empty_stream")
-                _record_committed_stream_failure(model)
+                _record_committed_stream_failure(model, reason="empty_stream", is_severe=True)
                 scheduler.release_client_request(client_id)
                 await _log_request(
                     client_id, key_id, model, 502, rt,
@@ -1327,8 +1502,24 @@ async def _handle_stream_request(
                 )
                 return
 
-            # 流式完成 - 发送[DONE]标记
-            yield "data: [DONE]\n\n"
+            # 流式完成 - 刷新可能剩余的思考/文本缓冲并发送[DONE]标记
+            if not seen_done:
+                tail_vis, tail_rsn = think_stripper.finish()
+                if tail_rsn or tail_vis:
+                    flushed_delta = {}
+                    if tail_rsn:
+                        flushed_delta["reasoning_content"] = tail_rsn
+                    if tail_vis:
+                        flushed_delta["content"] = tail_vis
+                    flushed_chunk = {
+                        "id": f"chatcmpl_{uuid.uuid4().hex[:12]}",
+                        "object": "chat.completion.chunk",
+                        "created": int(time.time()),
+                        "model": model,
+                        "choices": [{"index": 0, "delta": flushed_delta, "finish_reason": seen_finish_reason or None}]
+                    }
+                    yield f"data: {json.dumps(flushed_chunk, ensure_ascii=False)}\n\n"
+                yield "data: [DONE]\n\n"
 
             # 正常结束：所有数据已接收完毕
             rt = time.time() - start_time
@@ -1356,15 +1547,14 @@ async def _handle_stream_request(
         except httpx.TimeoutException:
             rt = time.time() - start_time
             scheduler.record_response(key_id, model, False, rt, 0, "timeout")
-            # 超时触发差异化冷却（15秒，不是隔离5分钟）
             scheduler.trigger_hard_cooldown(key_id, model, "timeout")
-            _record_committed_stream_failure(model)
+            _record_committed_stream_failure(model, reason="timeout", is_severe=True)
             error_data = {"error": {"message": "上游响应超时",
                                     "type": "timeout_error", "code": "upstream_timeout"}}
             yield f"data: {json.dumps(error_data)}\n\n"
-            yield "data: [DONE]\n\n"
+            if not seen_done:
+                yield "data: [DONE]\n\n"
             scheduler.release_client_request(client_id)
-            # : 记录超时错误日志
             await _log_request(
                 client_id, key_id, model, 504, rt, 0, 0, 0, True, _final_error_payload("上游响应超时"),
                 start_ts=start_time,
@@ -1375,24 +1565,20 @@ async def _handle_stream_request(
                 client_ip=get_client_ip(request), user_agent=request.headers.get("user-agent", "")[:512],
             )
         except httpx.ReadError as e:
-            # : 上游连接断开（常见的流式中途断连场景）
             rt = time.time() - start_time
             scheduler.record_response(key_id, model, False, rt, 0, "conn_error")
             logger.warning(f"流式读取错误: key={key_id[:8]} model={model} chunks={chunks_received} error={e}")
-            # 如果已收到部分数据，只记录为部分成功（不触发冷却/隔离）
-            if chunks_received > 0 and prompt_tokens > 0:
-                logger.info(f"流式部分完成: key={key_id[:8]} model={model} 已接收{chunks_received}个chunk, prompt={prompt_tokens} tokens")
-                # 有部分数据时尝试恢复：发送stop信号让客户端继续处理已收到的内容
-                finish_data = {"choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
-                yield f"data: {json.dumps(finish_data)}\n\n"
+            if raw_content_chunks > 0 and seen_finish_reason:
+                # 已经收到了正常的结束标记，网络在末尾关闭不属于异常中断
+                logger.info(f"流式已正常收到结束标记: key={key_id[:8]} model={model}")
             else:
                 scheduler.trigger_hard_cooldown(key_id, model, "timeout")
-                _record_committed_stream_failure(model)
-                # 无有效数据时发送error让客户端知道出错了，但不发送[DONE]阻止重试
+                _record_committed_stream_failure(model, reason=f"read_error: {e}", is_severe=True)
                 error_data = {"error": {"message": f"流式传输中断: {str(e)}",
                                         "type": "connection_error", "code": "stream_interrupted"}}
-                yield f"data: {json.dumps(error_data)}\n\n"
-            yield "data: [DONE]\n\n"
+                yield f"data: {json.dumps(error_data, ensure_ascii=False)}\n\n"
+            if not seen_done:
+                yield "data: [DONE]\n\n"
             scheduler.release_client_request(client_id)
             await _log_request(
                 client_id, key_id, model, 502, rt,
@@ -1409,6 +1595,11 @@ async def _handle_stream_request(
         except Exception as e:
             rt = time.time() - start_time
             scheduler.record_response(key_id, model, False, rt, 0, "error")
+            err_type = type(e).__name__
+            is_sev = ("SSL" in err_type or "Remote" in err_type or "Protocol" in err_type or "Transport" in err_type or "Connection" in err_type)
+            scheduler.trigger_hard_cooldown(key_id, model, "conn_error" if is_sev else "error")
+            _record_committed_stream_failure(model, reason=f"{err_type}: {e}", is_severe=is_sev)
+            logger.warning(f"流式传输异常: key={key_id[:8]} model={model} error={err_type}: {e}")
             error_data = {"error": {"message": f"流式传输错误: {str(e)}",
                                     "type": "internal_error", "code": "stream_error"}}
             yield f"data: {json.dumps(error_data)}\n\n"
@@ -1418,7 +1609,7 @@ async def _handle_stream_request(
             await _log_request(
                 client_id, key_id, model, 500, rt, 0, 0, 0, True, _final_error_payload(f"流式传输错误: {str(e)}"),
                 start_ts=start_time,
-                error_type=type(e).__name__, error_detail=str(e)[:1024],
+                error_type=err_type, error_detail=str(e)[:1024],
                 include_errors=True, request_body=_req_body_json,
                 error_stack=traceback.format_exc()[:4096],
                 business_code="stream_error",
@@ -1493,6 +1684,23 @@ async def _handle_nonstream_request(
                 or (data.get("message") and isinstance(data["message"], dict) and data["message"].get("usage"))
             ) if isinstance(data, dict) else {}
             prompt_tokens, completion_tokens, total_tokens, cached_tokens, cache_write_tokens = _extract_usage_tokens(u)
+
+            # 剥离并提取思维链标签（<thinking>, <think>, <thought>, <reasoning>）
+            if isinstance(data, dict) and data.get("choices"):
+                from app.think_stripper import strip_think_tags
+                for choice in data["choices"]:
+                    if isinstance(choice, dict):
+                        msg = choice.get("message")
+                        if isinstance(msg, dict):
+                            content = msg.get("content")
+                            if isinstance(content, str) and content:
+                                clean_vis, extracted_rsn = strip_think_tags(content)
+                                msg["content"] = clean_vis
+                                if extracted_rsn:
+                                    existing_rsn = msg.get("reasoning_content") or msg.get("reasoning") or ""
+                                    msg["reasoning_content"] = (existing_rsn + "\n" + extracted_rsn).strip() if existing_rsn else extracted_rsn
+                            if "reasoning" in msg and "reasoning_content" not in msg:
+                                msg["reasoning_content"] = msg.pop("reasoning")
 
             scheduler.record_response(key_id, model, True, rt, 200, "")
             scheduler.release_client_request(client_id)
@@ -1687,6 +1895,9 @@ async def _dispatch_once(
         f"base={effective_base_url} model={model}"
     )
 
+    body = dict(body)
+    _adapt_reasoning_effort_for_provider(body, provider=provider, model_ref=model, base_url=effective_base_url)
+
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -1825,10 +2036,14 @@ async def _call_upstream_chain(
     chain_started = dispatch_start_time if dispatch_start_time else time.time()
     budget_exhausted_logged = False
 
-    # 预取熔断快照：既用于跳过判断，也用于判断某候选后面是否还有"真正可切"的备选
-    cooling_flags = [vm.is_model_cooling(m) for m in chain]
+    # 动态获取当前请求的候选链顺序（支持平滑轮询 round-robin、主备优先 priority、自适应感知 adaptive）
+    ordered_chain = vm.get_ordered_chain(virtual_id) or chain
+    logger.info(f"[聚合] 虚拟模型 {virtual_id} 调度队列: {ordered_chain}")
 
-    for idx, real_model in enumerate(chain):
+    # 预取熔断快照：既用于跳过判断，也用于判断某候选后面是否还有"真正可切"的备选
+    cooling_flags = [vm.is_model_cooling(m) for m in ordered_chain]
+
+    for idx, real_model in enumerate(ordered_chain):
         # 软熔断跳过（但记录，若全部在熔断中则最后放宽重试第一个）
         if cooling_flags[idx]:
             rem = vm.cooldown_remaining(real_model)
@@ -1842,7 +2057,7 @@ async def _call_upstream_chain(
         tried_any = True
 
         # 整链预算：超时后跳过"还有备选"的候选，把时间留给链尾兜底模型
-        has_fallback = any(not cooling_flags[j] for j in range(idx + 1, len(chain)))
+        has_fallback = any(not cooling_flags[j] for j in range(idx + 1, len(ordered_chain)))
         if has_fallback and time.time() - chain_started > vm.CHAIN_TOTAL_BUDGET_SECONDS:
             if not budget_exhausted_logged:
                 budget_exhausted_logged = True
@@ -1863,6 +2078,7 @@ async def _call_upstream_chain(
         pre_stripped = _strip_blocked_params(real_model, sub_body)
         if pre_stripped:
             logger.info(f"[聚合] {real_model} 预防性剥离已知不支持参数 {pre_stripped}")
+        _adapt_reasoning_effort_for_provider(sub_body, provider=_, model_ref=real_model, base_url=base_upstream_url)
         if is_stream:
             sub_body.setdefault("stream_options", {})
             if isinstance(sub_body["stream_options"], dict):
@@ -1976,16 +2192,18 @@ async def _call_upstream_chain(
         # 只有模型不可用或真实瞬时故障才进入聚合软熔断；
         # 请求级错误已在上方返回，no_key 不计入（避免误伤健康模型）。
         if model_failed:
-            vm.record_model_failure(real_model)
+            is_sev = last_kind in ("network", "ssl", "503", "conn_error", "timeout", "upstream_error")
+            vm.record_model_failure(real_model, reason=last_kind, is_severe=is_sev)
 
     # 如果所有模型都在软熔断中（一个都没真正尝试），放宽：强试第一个，避免全链假死
-    if not tried_any and all_cooling and chain:
-        forced = chain[0]
+    if not tried_any and all_cooling and ordered_chain:
+        forced = ordered_chain[0]
         logger.warning(f"[聚合] 全链熔断中，强制尝试首个模型 {forced}")
         _, upstream_model = _split_provider_model_ref(forced)
         sub_body = dict(body)
         sub_body["model"] = upstream_model
         sub_body = apply_model_defaults(sub_body)
+        _adapt_reasoning_effort_for_provider(sub_body, provider=_, model_ref=forced, base_url=base_upstream_url)
         if is_stream:
             sub_body.setdefault("stream_options", {})
             if isinstance(sub_body["stream_options"], dict):
@@ -2597,3 +2815,151 @@ async def embeddings(request: Request):
             user_agent=request.headers.get("user-agent", "")[:512],
         )
         raise HTTPException(status_code=degradation["status_code"], detail=degradation)
+
+
+# ========== Responses API 端点 (专门服务 ChatGPT Desktop / Codex CLI) ==========
+
+@router.post("/v1/responses", tags=["公共API"])
+@router.post("/api/v1/responses", tags=["公共API"])
+async def responses_endpoint(request: Request):
+    """
+    OpenAI Responses API 兼容端点
+    支持 ChatGPT Desktop (Codex) / Codex CLI 等使用 wire_api = "responses" 的客户端。
+    将 Responses API 请求转换为内部 Chat Completions 请求，调用聚合模型链/单模型，
+    并将输出转换回 Responses API 格式或 SSE 事件流。
+    """
+    # 1. 客户端认证
+    client_info = await asyncio.to_thread(authenticate_client, request)
+    client_id = client_info["client_id"]
+
+    # 2. 解析请求体
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail={
+            "message": "请求体JSON解析失败",
+            "type": "invalid_request_error",
+            "code": "invalid_json",
+        })
+
+    from app.responses_bridge import (
+        responses_request_to_chat,
+        chat_response_to_responses_api,
+        ChatToResponsesSseAdapter,
+    )
+
+    # 3. 将 Responses API 请求转换为 Chat Completions 请求格式
+    chat_body = responses_request_to_chat(body)
+    model = chat_body.get("model", "")
+    is_stream = bool(chat_body.get("stream", False))
+
+    request.state.log_model = model
+    request.state.log_is_stream = is_stream
+    request.state.log_client_id = client_id
+    request.state.upstream_attempts = []
+
+    if not model:
+        raise HTTPException(status_code=400, detail={
+            "message": "缺少model参数",
+            "type": "invalid_request_error",
+            "code": "missing_model",
+        })
+
+    # === 虚拟聚合模型与定点路由逻辑 ===
+    from app import virtual_models as _vm
+    _is_virtual = _vm.is_virtual_model(model)
+    _virtual_chain = _vm.get_chain(model) if _is_virtual else []
+    if _is_virtual and not _virtual_chain:
+        raise HTTPException(status_code=503, detail={
+            "message": f"聚合模型 '{model}' 未配置任何可用的真实模型",
+            "type": "service_unavailable",
+            "code": "virtual_model_empty_chain",
+        })
+
+    _pinned_provider, _pinned_model = _split_provider_model_ref(model)
+    _is_pinned = bool(_pinned_provider and _pinned_model)
+    if _is_pinned:
+        chat_body["model"] = _pinned_model
+
+    corrected_model, was_corrected = (model, False) if (_is_virtual or _is_pinned) else validate_and_correct_model(model)
+    if was_corrected:
+        chat_body["model"] = corrected_model
+        model = corrected_model
+    elif model != corrected_model:
+        suggestion = build_model_error_suggestion(model)
+        raise HTTPException(status_code=400, detail={
+            "message": f"模型ID '{model}' 无效。{suggestion}",
+            "type": "invalid_request_error",
+            "code": "invalid_model",
+        })
+
+    validate_and_sanitize(chat_body)
+    chat_body = apply_model_defaults(chat_body)
+
+    if is_stream:
+        if "stream_options" not in chat_body:
+            chat_body["stream_options"] = {}
+        chat_body["stream_options"]["include_usage"] = True
+
+    if not _is_virtual:
+        cb = get_circuit_breaker()
+        cb_key = f"model:{model}"
+        if not cb.can_request(cb_key):
+            degradation = graceful_degradation_response("circuit_open")
+            raise HTTPException(status_code=degradation["status_code"], detail={
+                "message": degradation["message"],
+                "type": degradation["type"],
+                "code": degradation["code"],
+                "suggestion": degradation["suggestion"],
+            })
+
+    scheduler = get_scheduler()
+    await scheduler._ensure_pools()
+    scheduler.record_client_request(client_id, model)
+
+    raw_base_url = get_setting("upstream_base_url") or "https://integrate.api.nvidia.com/v1"
+    base_url, _ = normalize_base_url(raw_base_url)
+    chat_path = get_setting("chat_path") or "/chat/completions"
+    upstream_url = f"{base_url}{chat_path}"
+    timeout = get_timeout_for_model(_pinned_model if _is_pinned else model)
+    _request_start_ts = time.time()
+
+    if _is_virtual:
+        raw_resp = await _call_upstream_chain(
+            scheduler, client_id, model, _virtual_chain,
+            upstream_url, chat_body, is_stream, request,
+            dispatch_start_time=_request_start_ts
+        )
+    else:
+        raw_resp = await _call_upstream(
+            scheduler, client_id, model, upstream_url, chat_body, timeout, is_stream, request,
+            dispatch_start_time=_request_start_ts
+        )
+
+    # 4. 将响应转换回 Responses API 格式
+    if not is_stream:
+        try:
+            content_bytes = raw_resp.body
+            chat_data = json.loads(content_bytes.decode("utf-8") if isinstance(content_bytes, bytes) else content_bytes)
+            responses_data = chat_response_to_responses_api(chat_data, model)
+            return JSONResponse(content=responses_data, status_code=raw_resp.status_code)
+        except Exception as e:
+            logger.error(f"Responses API 非流式格式转换失败: {e}")
+            return raw_resp
+
+    # 流式模式：将 chat.completion.chunk SSE 转换为 Responses API SSE 事件流
+    async def responses_event_stream():
+        adapter = ChatToResponsesSseAdapter(model)
+        async for sse_chunk in adapter.stream_from_chat_iterator(raw_resp.body_iterator):
+            yield sse_chunk
+
+    return StreamingResponse(
+        responses_event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+

@@ -171,6 +171,7 @@ class VirtualModelCreateRequest(BaseModel):
     id: str                          # 虚拟模型 ID（客户端填这个）
     display_name: str = ""           # 展示名（可选）
     chain: List[str] = []            # 有序真实模型链
+    routing_strategy: Optional[str] = "round-robin"  # round-robin | priority | adaptive
     enabled: bool = True
 
 
@@ -179,6 +180,7 @@ class VirtualModelUpdateRequest(BaseModel):
     new_id: Optional[str] = None
     display_name: Optional[str] = None
     chain: Optional[List[str]] = None
+    routing_strategy: Optional[str] = None
     enabled: Optional[bool] = None
 
 
@@ -1235,7 +1237,8 @@ async def list_virtual_models(request: Request):
         item = dict(m)
         item["cooldowns"] = {rm: cooldowns.get(rm, 0) for rm in (m.get("chain") or [])}
         result.append(item)
-    return {"virtual_models": result, "cooldowns": cooldowns}
+    health_stats = getattr(vm, "get_model_health_stats", lambda: {})()
+    return {"virtual_models": result, "cooldowns": cooldowns, "health_stats": health_stats}
 
 
 @router.post("/virtual-models", tags=["管理员"])
@@ -1262,6 +1265,7 @@ async def create_virtual_model(req: VirtualModelCreateRequest, request: Request)
         "id": vid,
         "display_name": (req.display_name or vid).strip(),
         "chain": chain,
+        "routing_strategy": req.routing_strategy or "round-robin",
         "enabled": bool(req.enabled),
     })
     vm.save_virtual_models(models)
@@ -1302,6 +1306,8 @@ async def update_virtual_model(vid: str, req: VirtualModelUpdateRequest, request
         target["display_name"] = (req.display_name or new_vid).strip()
     elif target.get("display_name") == vid:
         target["display_name"] = new_vid  # 显示名此前跟随旧 ID，改名时一并同步
+    if req.routing_strategy is not None:
+        target["routing_strategy"] = req.routing_strategy or "round-robin"
     if req.enabled is not None:
         target["enabled"] = bool(req.enabled)
     target["id"] = new_vid

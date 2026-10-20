@@ -1806,7 +1806,7 @@ R.vmodels = async function() {
     } else {
       const wrap = document.createElement('div');
       wrap.className = 'table-wrap';
-      let html = '<table><thead><tr><th>虚拟模型 ID</th><th>显示名</th><th>当前使用模型</th><th>状态</th><th>操作</th></tr></thead><tbody>';
+      let html = '<table><thead><tr><th>虚拟模型 ID</th><th>显示名</th><th>调度策略</th><th>当前使用模型</th><th>状态</th><th>操作</th></tr></thead><tbody>';
       list.forEach(v => {
         const chain = v.chain || [];
         const cd = v.cooldowns || {};
@@ -1821,7 +1821,11 @@ R.vmodels = async function() {
         }
         const spare = chain.length > 1 ? ' <span class="text-dim" style="font-size:11px">+' + (chain.length - 1) + ' 备用</span>' : '';
         const st = v.enabled === false ? badge('已停用', 'red') : badge('启用中', 'green');
-        html += '<tr><td><code>' + escapeHtml(v.id) + '</code></td><td>' + escapeHtml(v.display_name || '-') + '</td><td>' + curHtml + spare + '</td><td>' + st + '</td><td class="flex gap-8">';
+        const strat = v.routing_strategy || 'round-robin';
+        let stratBadge = '<span class="badge badge-blue">🔄 轮询均衡</span>';
+        if (strat === 'priority') stratBadge = '<span class="badge badge-purple">⚡ 主备优先</span>';
+        else if (strat === 'adaptive') stratBadge = '<span class="badge badge-cyan">🧠 自适应</span>';
+        html += '<tr><td><code>' + escapeHtml(v.id) + '</code></td><td>' + escapeHtml(v.display_name || '-') + '</td><td>' + stratBadge + '</td><td>' + curHtml + spare + '</td><td>' + st + '</td><td class="flex gap-8">';
         html += '<button class="btn btn-sm" data-id="' + escapeHtml(v.id) + '" data-action="edit">编辑</button>';
         html += '<button class="btn btn-sm btn-danger" data-id="' + escapeHtml(v.id) + '" data-action="delete">删除</button>';
         html += '</td></tr>';
@@ -1964,6 +1968,14 @@ async function vmodelFormModal(mode, v) {
         '<div class="form-group"><label>虚拟模型 ID</label>' + idField + (isEdit ? '<div class="text-sec" style="font-size:12px;margin-top:4px">可修改；改后客户端需改用新 ID 调用</div>' : '') + '</div>' +
         '<div class="form-group"><label>显示名（可选）</label><input id="vm_dname" placeholder="如：我的聚合模型" value="' + escapeHtml(v.display_name || '') + '"></div>' +
       '</div>' +
+      '<div class="form-group"><label>路由调度策略</label>' +
+        '<select id="vm_routing_strategy" style="width:100%">' +
+          '<option value="round-robin">🔄 轮询均衡 (Round-Robin) — 推荐：请求在备选模型间平滑轮流分发，负载均摊</option>' +
+          '<option value="priority">⚡ 主备优先 (Priority Failover) — 优先尝试第一模型，故障时按序向下容灾</option>' +
+          '<option value="adaptive">🧠 自适应感知 (Adaptive Health) — 结合延迟与成功率动态分发</option>' +
+        '</select>' +
+        '<div class="text-sec" style="font-size:12px;margin-top:4px">轮询模式可避免单一模型持续受压或故障卡死；无论哪种策略，发生故障均会自动无缝向后故障转移。</div>' +
+      '</div>' +
       '<div class="form-group"><label>模型链（按顺序，越靠前优先级越高）</label>' +
         '<div class="text-sec" style="font-size:12px;margin-bottom:6px">' + chainHint + '</div>' +
         '<div id="vm_chain"></div>' +
@@ -1979,6 +1991,9 @@ async function vmodelFormModal(mode, v) {
     '</div>';
 
   showModal(html, true);
+  if (document.getElementById('vm_routing_strategy')) {
+    document.getElementById('vm_routing_strategy').value = v.routing_strategy || 'round-robin';
+  }
 
   // 预填模型链
   const chain = Array.isArray(v.chain) ? v.chain : [];
@@ -1991,6 +2006,7 @@ async function vmodelFormModal(mode, v) {
   document.getElementById('vm_save_btn').addEventListener('click', async function() {
     const vid = (document.getElementById('vm_id').value || '').trim();
     const dname = (document.getElementById('vm_dname').value || '').trim();
+    const routingStrategy = (document.getElementById('vm_routing_strategy') ? document.getElementById('vm_routing_strategy').value : 'round-robin') || 'round-robin';
     const enabled = document.getElementById('vm_enabled').checked;
     const chainArr = _vmCollectChain();
     if (!vid) { toast('请填写虚拟模型 ID', 'error'); return; }
@@ -1998,7 +2014,7 @@ async function vmodelFormModal(mode, v) {
     this.disabled = true;
     try {
       if (isEdit) {
-        const body = { display_name: dname, chain: chainArr, enabled: enabled };
+        const body = { display_name: dname, chain: chainArr, routing_strategy: routingStrategy, enabled: enabled };
         if (vid && vid !== (v.id || '')) body.new_id = vid;
         await api('/virtual-models/' + encodeURIComponent(v.id || vid), {
           method: 'PUT',
@@ -2008,7 +2024,7 @@ async function vmodelFormModal(mode, v) {
       } else {
         await api('/virtual-models', {
           method: 'POST',
-          body: JSON.stringify({ id: vid, display_name: dname, chain: chainArr, enabled: enabled })
+          body: JSON.stringify({ id: vid, display_name: dname, chain: chainArr, routing_strategy: routingStrategy, enabled: enabled })
         });
         closeModal(); toast('聚合模型已创建', 'success'); R.vmodels();
       }

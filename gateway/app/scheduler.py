@@ -43,23 +43,32 @@ logger = logging.getLogger("acu.scheduler")
 # ========== 模型特性配置 ==========
 
 # 慢速模型（首字节延迟高，需要更长超时）
-# 仅包含实测可用的模型
+# 包含大参数模型以及超大上下文预填充慢的模型（如 AMD 上游模型）
 SLOW_MODELS = {
     "z-ai/glm-5.2",
     "minimaxai/minimax-m3",
     "minimaxai/minimax-m2.7",
     "qwen/qwen3.5-397b-a17b",
     "nvidia/nemotron-3-ultra-550b-a55b",
+    "Qwen3.8-Flash-Next",
+    "Qwen3.8-27B",
+    "GLM-5.3-Flash",
+    "DeepSeek-V4.1-Flash",
+    "MiMo-V2.6-Flash",
 }
 
 # 慢速模型差异化切换阈值（统一38，确保所有模型容量一致）
-# 仅包含实测可用的模型
 SLOW_MODEL_THRESHOLDS = {
     "z-ai/glm-5.2": 38,
     "minimaxai/minimax-m3": 38,
     "minimaxai/minimax-m2.7": 38,
     "qwen/qwen3.5-397b-a17b": 38,
     "nvidia/nemotron-3-ultra-550b-a55b": 38,
+    "Qwen3.8-Flash-Next": 38,
+    "Qwen3.8-27B": 38,
+    "GLM-5.3-Flash": 38,
+    "DeepSeek-V4.1-Flash": 38,
+    "MiMo-V2.6-Flash": 38,
 }
 
 # 推理模型（返回 reasoning_content 字段）
@@ -68,15 +77,35 @@ REASONING_MODELS = {
     "deepseek-ai/deepseek-v4-pro",
     "openai/gpt-oss-120b",
     "openai/gpt-oss-20b",
+    "Qwen3.8-Flash-Next",
+    "Qwen3.8-27B",
+    "GLM-5.3-Flash",
+    "DeepSeek-V4.1-Flash",
 }
 
-# 模型默认参数（基于NVIDIA NIM使用示例）
+# 模型默认参数（超大输出上限保障，彻底避免未设置 max_tokens 时过早截断）
 MODEL_DEFAULTS = {
-    "z-ai/glm-5.2": {"temperature": 1, "top_p": 1, "max_tokens": 16384},
-    "minimaxai/minimax-m3": {"temperature": 1.0, "top_p": 0.95, "max_tokens": 8192},
-    "minimaxai/minimax-m2.7": {"temperature": 1.0, "top_p": 0.95, "max_tokens": 8192},
-    "deepseek-ai/deepseek-v4-pro": {"temperature": 1, "top_p": 0.95, "max_tokens": 16384},
-    "deepseek-ai/deepseek-v4-flash": {"temperature": 1, "top_p": 0.95, "max_tokens": 16384},
+    "z-ai/glm-5.2": {"temperature": 1, "top_p": 1, "max_tokens": 65536},
+    "minimaxai/minimax-m3": {"temperature": 1.0, "top_p": 0.95, "max_tokens": 16384},
+    "minimaxai/minimax-m2.7": {"temperature": 1.0, "top_p": 0.95, "max_tokens": 16384},
+    "deepseek-ai/deepseek-v4-pro": {"temperature": 1, "top_p": 0.95, "max_tokens": 65536},
+    "deepseek-ai/deepseek-v4-flash": {"temperature": 1, "top_p": 0.95, "max_tokens": 65536},
+    "Qwen3.8-Flash-Next": {"max_tokens": 65536},
+    "Qwen3.8-27B": {"max_tokens": 65536},
+    "qwen3.8-flash-free": {"max_tokens": 65536},
+    "glm-5.3-flash-free": {"max_tokens": 65536},
+    "glm-5.3-flash-free-2": {"max_tokens": 65536},
+    "GLM-5.3-Flash": {"max_tokens": 65536},
+    "DeepSeek-V4.1-Flash": {"max_tokens": 65536},
+    "deepseek-v4.1-flash-free": {"max_tokens": 65536},
+    "MiMo-V2.6-Flash": {"max_tokens": 65536},
+    "mimo-v2.6-pro-free": {"max_tokens": 65536},
+    "gpt-6.1-sol": {"max_tokens": 65536},
+    "master": {"max_tokens": 65536},
+    "openai/gpt-5.6-luna": {"max_tokens": 65536},
+    "gpt-5.6-luna": {"max_tokens": 65536},
+    "grok-4.7": {"max_tokens": 32768},
+    "agnes-3.0-flash": {"max_tokens": 32768},
 }
 
 # 超时配置
@@ -97,13 +126,26 @@ def get_timeout_for_model(model: str) -> float:
 
 
 def apply_model_defaults(body: dict) -> dict:
-    """根据NVIDIA NIM使用示例自动补全模型默认参数（不覆盖用户设置）"""
+    """自动补全模型默认参数与大容量输出上限，彻底避免客户端传小配额或思考过程挤占导致截断"""
     model = body.get("model", "")
     defaults = MODEL_DEFAULTS.get(model)
+    target_max = defaults.get("max_tokens", 65536) if defaults else 65536
+
+    # 1. 强力提升 max_tokens：只要现有配置小于 target_max，一律提升至超大上限（默认65536）
+    cur_max = body.get("max_tokens") or body.get("max_completion_tokens") or 0
+    if not isinstance(cur_max, int) or cur_max < target_max:
+        body["max_tokens"] = target_max
+        body["max_completion_tokens"] = target_max
+
+    # 2. 补齐其余默认参数
     if defaults:
         for key, value in defaults.items():
-            if key not in body:
+            if key not in ("max_tokens", "max_completion_tokens") and key not in body:
                 body[key] = value
+
+    # 3. 保持 max_tokens 与 max_completion_tokens 双向同步
+    body["max_completion_tokens"] = body["max_tokens"]
+
     return body
 
 
@@ -772,6 +814,10 @@ class SurgeScheduler:
                 )
         elif reason == "timeout":
             cooldown_seconds = self.COOLDOWN_TIMEOUT_SECONDS
+        elif reason in ("5xx", "upstream_stream_error", "empty_stream", "error", "conn_error"):
+            # 5xx/流式断开/连接错误退避：连续发生时指数增加冷却时长（15s, 30s, 60s, 120s），避免刚失败就立即重新调度
+            backoff = min(2 ** max(0, getattr(bucket, "consecutive_5xx", 1) - 1), 8)
+            cooldown_seconds = min(15 * max(1, backoff), 120)
         else:
             cooldown_seconds = self.COOLDOWN_SECONDS
 
@@ -1167,7 +1213,7 @@ class SurgeScheduler:
         # 获取所有活跃上游密钥
         upstreams = self._get_active_keys()
         if not upstreams:
-            logger.warning("select_key: 无活跃上游密钥")
+            logger.warning("[key_dispatch] 无活跃上游密钥")
             self._stats.total_none_returns += 1
             return None
 
@@ -1189,7 +1235,7 @@ class SurgeScheduler:
                     if upstream.get("provider") == selected_provider
                 ]
                 logger.info(
-                    f"select_key: model={model} 精确路由 provider={selected_provider}, "
+                    f"[key_dispatch] model={model} 精确路由 provider={selected_provider}, "
                     f"候选数={len(upstreams)}"
                 )
                 if not upstreams:
@@ -1226,12 +1272,12 @@ class SurgeScheduler:
                     if upstream.get("provider") in target_providers
                 ]
                 logger.info(
-                    f"select_key: model={model} 命中映射 providers={sorted(target_providers)}, "
+                    f"[key_dispatch] model={model} 命中映射 providers={sorted(target_providers)}, "
                     f"候选数={len(upstreams)}"
                 )
                 if not upstreams:
                     logger.warning(
-                        f"select_key: model={model} 已配置路由但没有活跃候选 "
+                        f"[key_dispatch] model={model} 已配置路由但没有活跃候选 "
                         f"providers={sorted(target_providers)}"
                     )
                     self._stats.total_none_returns += 1
@@ -1240,35 +1286,39 @@ class SurgeScheduler:
         now = time.time()
 
         # === 第一轮：硬性过滤（不可放宽） ===
+        # === 第一部分：硬性过滤（不可放宽）===
         # 5元组: (key_id, api_key, provider, base_url, filtered_reason)
         hard_filtered = []
         for up in upstreams:
             key_id = up["id"]
             provider = up.get("provider", "nvidia")
             base_url = up.get("base_url") or ""
-            bucket = self._get_bucket(key_id, model)
+            ciphertext = up.get("api_key_ciphertext")
 
-            # 冷却状态过滤
-            if bucket.is_cooled_down():
-                hard_filtered.append((key_id, "", provider, base_url, "cooldown"))
-                continue
-            # 隔离过滤
-            if bucket.is_isolated():
-                hard_filtered.append((key_id, "", provider, base_url, "isolation"))
-                continue
-            # 自愈过滤
-            if bucket.is_healing():
-                hard_filtered.append((key_id, "", provider, base_url, "healing"))
-                continue
-            # 密钥解密
-            api_key = self._ensure_key_cached(key_id, up["api_key_ciphertext"])
+            # 密钥解密先执行并缓存，确保降级模式也能拿到有效明文密钥
+            api_key = self._ensure_key_cached(key_id, ciphertext)
             if not api_key:
                 hard_filtered.append((key_id, "", provider, base_url, "decrypt_failed"))
                 continue
 
-            # v10.0: 自动停用密钥过滤（连续认证失败被停用的密钥）
+            # v10.0: 自动停用密钥过滤（认证失败被停用的密钥）
             if key_id in self._auto_deactivated_keys:
                 hard_filtered.append((key_id, "", provider, base_url, "auto_deactivated"))
+                continue
+
+            bucket = self._get_bucket(key_id, model)
+
+            # 冷却状态跳过
+            if bucket.is_cooled_down():
+                hard_filtered.append((key_id, api_key, provider, base_url, "cooldown"))
+                continue
+            # 隔离状态跳过
+            if bucket.is_isolated():
+                hard_filtered.append((key_id, api_key, provider, base_url, "isolation"))
+                continue
+            # 自愈探测中跳过
+            if bucket.is_healing():
+                hard_filtered.append((key_id, api_key, provider, base_url, "healing"))
                 continue
 
             hard_filtered.append((key_id, api_key, provider, base_url, "ok"))
@@ -1276,44 +1326,44 @@ class SurgeScheduler:
         # 收集通过硬性过滤的密钥
         eligible = [(kid, ak, prov, burl) for kid, ak, prov, burl, reason in hard_filtered if reason == "ok"]
         if not eligible:
-            # 降级模式：所有密钥都在冷却/隔离中，选择冷却剩余时间最短的桶强制恢复
+            # 降级模式：若所有密钥均在冷却/隔离/自愈中，选择剩余时间最短的桶强制恢复
             best_cooldown_key = None
+            best_cooldown_ak = None
             best_cooldown_provider = "nvidia"
             best_cooldown_base_url = ""
             min_remaining = float('inf')
-            for key_id, _, provider, base_url, reason in hard_filtered:
-                if reason == "cooldown":
+            for key_id, ak, provider, base_url, reason in hard_filtered:
+                if reason in ("cooldown", "isolation", "healing") and ak:
                     bucket = self._get_bucket(key_id, model)
-                    remaining = bucket.cooldown_until - now
+                    remaining = (bucket.isolation_until if reason == "isolation" else bucket.cooldown_until) - now
                     if remaining < min_remaining:
                         min_remaining = remaining
                         best_cooldown_key = key_id
+                        best_cooldown_ak = ak
                         best_cooldown_provider = provider
                         best_cooldown_base_url = base_url
-                elif reason in ("healing", "isolation", "decrypt_failed"):
-                    # 隔离/自愈/解密失败的桶不能强制恢复
+                elif reason in ("decrypt_failed", "auto_deactivated"):
                     continue
 
-            if best_cooldown_key:
-                # 强制解除该桶的冷却，让它立即参与轮询
+            if best_cooldown_key and best_cooldown_ak:
+                # 强制解除该桶冷却/隔离，允许查询
                 bucket = self._get_bucket(best_cooldown_key, model)
-                bucket.cooldown_until = 0  # 立即恢复
+                bucket.cooldown_until = 0
+                bucket.isolation_until = 0
+                bucket.consecutive_conn_fail = 0
                 bucket.warmup_progress = 0
-                api_key = self._ensure_key_cached(best_cooldown_key, None)
-                if api_key:
-                    logger.warning(
-                        f"select_key降级模式: 所有密钥冷却中，强制恢复 key={best_cooldown_key[:8]} "
-                        f"model={model} 剩余冷却={min_remaining:.1f}s"
-                    )
-                    self.record_key_usage(best_cooldown_key, model)
-                    return (best_cooldown_key, api_key, model, best_cooldown_provider, best_cooldown_base_url)
+                logger.warning(
+                    f"[key_dispatch] 降级模式: 所有密钥均在冷却/隔离中，强制恢复最快就绪的 key={best_cooldown_key[:8]} "
+                    f"model={model} 剩余时间={min_remaining:.1f}s"
+                )
+                self.record_key_usage(best_cooldown_key, model)
+                return (best_cooldown_key, best_cooldown_ak, model, best_cooldown_provider, best_cooldown_base_url)
 
-            # 真正无法选择（无密钥或所有密钥解密失败）
-            logger.warning(f"select_key: 无法选择密钥 model={model} (候选池为空，降级模式也无可用密钥)")
+            # 确实无法选择密钥（无密钥或解密失败）
+            logger.warning(f"[key_dispatch] 无法选择密钥 model={model} (候选为空，降级模式也无可用的密钥)")
             self._stats.total_none_returns += 1
             return None
 
-        # === 第二轮：软性过滤 + 健康性评分 ===
         # 密钥不放弃，软过滤仅用于排序优先级调整
         # 8元组: (bucket_count, key_count, dispatch_seq, score, key_id, api_key, provider, base_url)
         healthy_candidates = []
@@ -1331,20 +1381,12 @@ class SurgeScheduler:
             # 密钥都参与轮询，不因软繁忙/预判/低评分排除
             healthy_candidates.append((bucket_count, key_count, dispatch_seq, score, key_id, api_key, provider, base_url))
 
-        # 密钥都参与轮询，不再需要最小候选池保障
-
         if not healthy_candidates:
-            # 已在eligible阶段处理降级模式，此处理论上不应到达
-            logger.warning(f"select_key: 健康候选池为空（不应到达此处） model={model}")
+            logger.warning(f"[key_dispatch] 健康候选池为空 model={model}")
             self._stats.total_none_returns += 1
             return None
 
         # === 严格公平排序 ===
-        # 排序优先级（5密钥池适配）：
-        # 1. 桶级近期使用次数（升序）- 使用最少的优先
-        # 2. 分配序号（升序）- 同计数时按轮询顺序（确保严格轮询）
-        # 3. 健康评分（降序）- 最终质量保障
-        # 注：移除key_count作为排序键，避免跨模型计数干扰单模型均衡
         healthy_candidates.sort(key=lambda x: (x[0], x[2], -x[3]))
 
         best = healthy_candidates[0]
@@ -1354,7 +1396,7 @@ class SurgeScheduler:
         self.record_key_usage(key_id, model)
 
         logger.info(
-            f"select_key选中: key={key_id[:8]} model={model} provider={provider} "
+            f"[key_dispatch] 分配密钥成功: key={key_id[:8]} model={model} provider={provider} "
             f"bucket_used={bucket_count} key_used={key_count} "
             f"score={score:.4f} (候选{len(healthy_candidates)}个)"
         )

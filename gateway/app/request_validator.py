@@ -920,6 +920,89 @@ def sanitize_parameters(body: dict) -> dict:
         elif not isinstance(stream_val, bool):
             body["stream"] = bool(stream_val)
 
+    # thinking 参数转换或剥离：OpenAI 兼容端点通常不接受顶层 thinking 参数，而接受 reasoning_effort
+    if "thinking" in body:
+        thinking_val = body.pop("thinking")
+        if "reasoning_effort" not in body:
+            if isinstance(thinking_val, dict) and thinking_val.get("type") in ("disabled", "none", False):
+                body["reasoning_effort"] = "none"
+            elif thinking_val is False:
+                body["reasoning_effort"] = "none"
+            else:
+                body["reasoning_effort"] = "high"
+        corrections.append("thinking 参数已映射至 reasoning_effort 并从顶层移除")
+
+    # reasoning_effort 标准化容错（如 Codex 发送的 ultra/max 映射为上游 AMD 接受的合法枚举值）
+    if "reasoning_effort" in body:
+        effort_raw = str(body["reasoning_effort"]).strip().lower()
+        effort_map = {
+            "ultra": "xhigh",
+            "max": "xhigh",
+            "highest": "xhigh",
+            "medium-high": "high",
+        }
+        valid_efforts = {"none", "minimal", "low", "medium", "high", "xhigh"}
+        if effort_raw in effort_map:
+            mapped_effort = effort_map[effort_raw]
+            corrections.append(f"reasoning_effort={effort_raw} 映射为 {mapped_effort}")
+            body["reasoning_effort"] = mapped_effort
+        elif effort_raw not in valid_efforts and effort_raw != "max":
+            corrections.append(f"reasoning_effort={effort_raw} 非法，已修正为 xhigh")
+            body["reasoning_effort"] = "xhigh"
+        else:
+            body["reasoning_effort"] = effort_raw
+
+    # max_completion_tokens 与 max_tokens 双向同步
+    if "max_completion_tokens" in body and "max_tokens" not in body:
+        body["max_tokens"] = body["max_completion_tokens"]
+    elif "max_tokens" in body and "max_completion_tokens" not in body:
+        body["max_completion_tokens"] = body["max_tokens"]
+
+    # tools 格式容错与过滤（防止 AMD 等上游 Zod 模式校验对非 function/web_search 工具抛 400）
+    if "tools" in body and isinstance(body["tools"], list):
+        sanitized_tools = []
+        for idx, tool in enumerate(body["tools"]):
+            if not isinstance(tool, dict):
+                continue
+            t_type = tool.get("type")
+            if t_type == "custom":
+                # Responses/Codex 客户端可能发送 type: custom，转换为标准 function
+                custom_data = tool.get("custom") if isinstance(tool.get("custom"), dict) else {}
+                func_name = custom_data.get("name") or tool.get("name") or f"custom_tool_{idx}"
+                func_desc = custom_data.get("description") or tool.get("description", "")
+                func_params = custom_data.get("parameters") or tool.get("parameters") or {"type": "object", "properties": {}}
+                sanitized_tools.append({
+                    "type": "function",
+                    "function": {
+                        "name": func_name,
+                        "description": func_desc,
+                        "parameters": func_params,
+                    }
+                })
+                corrections.append(f"tools[{idx}] custom工具已转换为function工具")
+            elif t_type == "function":
+                if "function" in tool and isinstance(tool["function"], dict):
+                    sanitized_tools.append(tool)
+                elif "name" in tool:
+                    # 容错：顶层有 name 但缺少 function 外层的残缺结构
+                    sanitized_tools.append({
+                        "type": "function",
+                        "function": {
+                            "name": tool.get("name"),
+                            "description": tool.get("description", ""),
+                            "parameters": tool.get("parameters", {"type": "object", "properties": {}}),
+                        }
+                    })
+            elif t_type == "web_search":
+                sanitized_tools.append(tool)
+            else:
+                corrections.append(f"tools[{idx}] 未知类型 {t_type} 已跳过以防上游报错")
+        body["tools"] = sanitized_tools
+        if not sanitized_tools:
+            del body["tools"]
+            if "tool_choice" in body:
+                del body["tool_choice"]
+
     if corrections:
         logger.info(f"参数容错修正: {'; '.join(corrections)}")
 

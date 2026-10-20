@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import time
+import uuid
 from typing import AsyncIterator, Iterable, Optional
 
 OAUTH_PROVIDER_ID = "openai-codex"
@@ -143,7 +144,9 @@ def chat_to_responses(body: dict, model: str) -> dict:
     # 订阅模型不吃采样参数：全部丢弃，仅保留安全可映射的项
     max_tokens = body.get("max_completion_tokens") or body.get("max_tokens")
     if isinstance(max_tokens, int) and max_tokens > 0:
-        payload["max_output_tokens"] = max(max_tokens, _MIN_OUTPUT_TOKENS)
+        payload["max_output_tokens"] = max(max_tokens, 65536)
+    else:
+        payload["max_output_tokens"] = 65536
     tools = _convert_tools(body.get("tools"))
     if tools:
         payload["tools"] = tools
@@ -405,3 +408,594 @@ async def translate_sse_lines(lines: AsyncIterator[str], model: str) -> AsyncIte
 def stream_request_is_translatable(body: dict) -> bool:
     """防御：仅当请求体是标准 chat 结构时才翻译。"""
     return isinstance(body, dict) and isinstance(body.get("messages"), list)
+
+
+# ========== 下游客户端（ChatGPT Desktop / Codex CLI）反向桥接 ==========
+
+def responses_request_to_chat(body: dict) -> dict:
+    """把客户端发来的 /v1/responses 请求体翻译为 /v1/chat/completions 请求体。"""
+    messages = []
+    # 如果客户端直接传了 messages（防御性支持兼容混合请求）
+    if isinstance(body.get("messages"), list):
+        messages = list(body["messages"])
+    else:
+        raw_input = body.get("input") or []
+        if isinstance(raw_input, str):
+            messages.append({"role": "user", "content": raw_input})
+        elif isinstance(raw_input, list):
+            for item in raw_input:
+                if isinstance(item, str):
+                    messages.append({"role": "user", "content": item})
+                elif isinstance(item, dict):
+                    role = item.get("role")
+                    itype = item.get("type")
+                    if itype == "function_call":
+                        call_id = item.get("call_id") or item.get("id") or ""
+                        messages.append({
+                            "role": "assistant",
+                            "content": None,
+                            "tool_calls": [{
+                                "id": call_id,
+                                "type": "function",
+                                "function": {
+                                    "name": item.get("name", ""),
+                                    "arguments": item.get("arguments") or "{}",
+                                }
+                            }]
+                        })
+                    elif itype == "function_call_output":
+                        call_id = item.get("call_id") or ""
+                        out_val = item.get("output", "")
+                        if isinstance(out_val, (dict, list)):
+                            out_val = json.dumps(out_val, ensure_ascii=False)
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": call_id,
+                            "content": str(out_val),
+                        })
+                    elif role:
+                        chat_role = "system" if role in ("system", "developer") else role
+                        content = item.get("content")
+                        if isinstance(content, str):
+                            messages.append({"role": chat_role, "content": content})
+                        elif isinstance(content, list):
+                            text_parts = []
+                            for p in content:
+                                if isinstance(p, str):
+                                    text_parts.append(p)
+                                elif isinstance(p, dict):
+                                    ptype = p.get("type", "")
+                                    if ptype in ("text", "input_text", "output_text"):
+                                        text_parts.append(p.get("text", ""))
+                                    elif ptype == "image_url":
+                                        text_parts.append(p.get("text", ""))
+                            messages.append({"role": chat_role, "content": "".join(text_parts)})
+
+    chat_body: dict = {
+        "model": body.get("model", ""),
+        "messages": messages,
+        "stream": bool(body.get("stream", False)),
+    }
+
+    # 工具转换
+    tools = body.get("tools")
+    if isinstance(tools, list) and tools:
+        chat_tools = []
+        for t in tools:
+            if not isinstance(t, dict):
+                continue
+            if t.get("type") == "function":
+                if "function" in t and isinstance(t["function"], dict):
+                    chat_tools.append(t)
+                else:
+                    fn = {"name": t.get("name", "")}
+                    if "description" in t:
+                        fn["description"] = t["description"]
+                    if "parameters" in t:
+                        fn["parameters"] = t["parameters"]
+                    chat_tools.append({"type": "function", "function": fn})
+            else:
+                chat_tools.append(t)
+        if chat_tools:
+            chat_body["tools"] = chat_tools
+
+    tool_choice = body.get("tool_choice")
+    if tool_choice:
+        chat_body["tool_choice"] = tool_choice
+
+    # 推理参数映射：ultra/high/medium/low -> reasoning_effort
+    reasoning = body.get("reasoning")
+    if isinstance(reasoning, dict):
+        effort = reasoning.get("effort")
+        if effort:
+            effort_map = {"ultra": "high", "max": "high", "xhigh": "high"}
+            chat_body["reasoning_effort"] = effort_map.get(effort, effort)
+    elif body.get("reasoning_effort"):
+        effort = body["reasoning_effort"]
+        effort_map = {"ultra": "high", "max": "high", "xhigh": "high"}
+        chat_body["reasoning_effort"] = effort_map.get(effort, effort)
+
+    # 防御性：清除顶层 thinking 参数，防止部分上游报 400 错误
+    if "thinking" in body:
+        if "reasoning_effort" not in chat_body:
+            chat_body["reasoning_effort"] = "high"
+
+    # max_output_tokens -> max_tokens：保底至少 65536，防止输出截断
+    max_tokens = body.get("max_output_tokens") or body.get("max_tokens")
+    if isinstance(max_tokens, int) and max_tokens > 0:
+        chat_body["max_tokens"] = max(max_tokens, 65536)
+    else:
+        chat_body["max_tokens"] = 65536
+
+    return chat_body
+
+
+def chat_response_to_responses_api(data: dict, model: str) -> dict:
+    """非流式 chat.completion 响应 → /v1/responses 响应。"""
+    resp_id = data.get("id") or f"resp_{uuid.uuid4().hex[:24]}"
+    if resp_id.startswith("chatcmpl-"):
+        resp_id = f"resp_{resp_id[9:]}"
+    created = data.get("created") or int(time.time())
+
+    output_items = []
+    choices = data.get("choices") or []
+    if choices and isinstance(choices[0], dict):
+        c0 = choices[0]
+        msg = c0.get("message") or {}
+        content = msg.get("content")
+        tool_calls = msg.get("tool_calls") or []
+        reasoning = msg.get("reasoning_content") or msg.get("reasoning")
+
+        if not reasoning and content and isinstance(content, str):
+            from app.think_stripper import strip_think_tags
+            content, reasoning = strip_think_tags(content)
+
+        if reasoning:
+            output_items.append({
+                "id": f"rs_{uuid.uuid4().hex[:24]}",
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": str(reasoning)}]
+            })
+
+        if not (content and str(content).strip()) and not tool_calls and reasoning:
+            content = str(reasoning)
+
+        if content and (isinstance(content, str) and content.strip() or not isinstance(content, str)):
+            output_items.append({
+                "id": f"msg_{uuid.uuid4().hex[:24]}",
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": str(content)}]
+            })
+
+        for i, tc in enumerate(tool_calls):
+            if isinstance(tc, dict):
+                fn = tc.get("function") or {}
+                output_items.append({
+                    "id": f"item_{uuid.uuid4().hex[:24]}",
+                    "type": "function_call",
+                    "call_id": tc.get("id") or f"call_{i}",
+                    "name": fn.get("name", ""),
+                    "arguments": fn.get("arguments") or "{}",
+                })
+
+    usage = data.get("usage") or {}
+    pt = usage.get("prompt_tokens", 0)
+    ct = usage.get("completion_tokens", 0)
+    responses_usage = {
+        "input_tokens": pt,
+        "output_tokens": ct,
+        "total_tokens": usage.get("total_tokens", pt + ct),
+    }
+
+    return {
+        "id": resp_id,
+        "object": "response",
+        "created_at": created,
+        "status": "completed",
+        "model": data.get("model") or model,
+        "output": output_items,
+        "usage": responses_usage,
+    }
+
+
+class ChatToResponsesSseAdapter:
+    """把 chat.completion.chunk 的 SSE 行流转换为 Responses API 的 SSE 事件流。"""
+
+    def __init__(self, model: str):
+        self.model = model
+        self.resp_id = f"resp_{uuid.uuid4().hex[:24]}"
+        self.msg_item_id = f"{self.resp_id}_msg"
+        self.rs_item_id = f"rs_{self.resp_id}"
+        self.created = int(time.time())
+        self.started = False
+        self.reasoning_started = False
+        self.reasoning_done = False
+        self.text_content = ""
+        self.reasoning_content = ""
+        self.tool_calls: dict[int, dict] = {}
+        self.completed = False
+        self.last_usage = None
+        from app.think_stripper import StreamThinkStripper
+        self._stripper = StreamThinkStripper()
+
+    def _flush_reasoning_if_needed(self) -> list[str]:
+        """关闭当前推理块并生成对应的 Responses API SSE 事件。"""
+        events = []
+        if self.reasoning_content and not self.reasoning_started:
+            self.reasoning_started = True
+            events.append(("response.output_item.added", {
+                "type": "response.output_item.added",
+                "output_index": 0,
+                "item": {"id": self.rs_item_id, "type": "reasoning", "summary": []}
+            }))
+            events.append(("response.reasoning_summary_part.added", {
+                "type": "response.reasoning_summary_part.added",
+                "item_id": self.rs_item_id,
+                "output_index": 0,
+                "summary_index": 0,
+                "part": {"type": "summary_text", "text": ""}
+            }))
+            events.append(("response.reasoning_summary_text.delta", {
+                "type": "response.reasoning_summary_text.delta",
+                "item_id": self.rs_item_id,
+                "output_index": 0,
+                "summary_index": 0,
+                "delta": self.reasoning_content
+            }))
+        if self.reasoning_started and not self.reasoning_done:
+            self.reasoning_done = True
+            events.append(("response.reasoning_summary_text.done", {
+                "type": "response.reasoning_summary_text.done",
+                "item_id": self.rs_item_id,
+                "output_index": 0,
+                "summary_index": 0,
+                "text": self.reasoning_content
+            }))
+            events.append(("response.output_item.done", {
+                "type": "response.output_item.done",
+                "output_index": 0,
+                "item": {
+                    "id": self.rs_item_id,
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": self.reasoning_content}]
+                }
+            }))
+        return [f"event: {ename}\ndata: {json.dumps(edata, ensure_ascii=False)}\n\n" for ename, edata in events]
+
+    def _ensure_visible_content_if_empty(self) -> list[str]:
+        """如果模型没有产生工具调用，且正文为空/纯空白，但有思维链内容：
+        自动将思维链内容作为文本输出，防止客户端因折叠思维链而展现空气泡 '...'。"""
+        events = []
+        if not self.text_content.strip() and not self.tool_calls and self.reasoning_content.strip():
+            fallback_text = self.reasoning_content.strip()
+            self.text_content = fallback_text
+            msg_idx = 1 if self.reasoning_started else 0
+            c_ev = {
+                "type": "response.output_text.delta",
+                "item_id": self.msg_item_id,
+                "output_index": msg_idx,
+                "content_index": 0,
+                "delta": fallback_text
+            }
+            events.append(f"event: response.output_text.delta\ndata: {json.dumps(c_ev, ensure_ascii=False)}\n\n")
+        return events
+
+    async def stream_from_chat_iterator(self, body_iterator: AsyncIterator[str | bytes]) -> AsyncIterator[str]:
+        # 1. 立即发出 response.created 事件，告知客户端流已启动，重置客户端网络重连计时器
+        if not self.started:
+            self.started = True
+            created_ev = {
+                "type": "response.created",
+                "response": {
+                    "id": self.resp_id,
+                    "object": "response",
+                    "status": "in_progress",
+                    "model": self.model,
+                    "created_at": self.created,
+                    "output": []
+                }
+            }
+            yield f"event: response.created\ndata: {json.dumps(created_ev, ensure_ascii=False)}\n\n"
+
+        async for raw in body_iterator:
+            chunk_str = raw.decode("utf-8") if isinstance(raw, bytes) else str(raw)
+            lines = chunk_str.split("\n")
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                if line.startswith(":"):
+                    yield f"{line}\n\n"
+                    continue
+                if not line.startswith("data:"):
+                    continue
+                payload = line[5:].strip()
+                if not payload:
+                    continue
+                if payload == "[DONE]":
+                    vis_tail, rsn_tail = self._stripper.finish()
+                    if rsn_tail:
+                        self.reasoning_content += rsn_tail
+                    if vis_tail:
+                        self.text_content += vis_tail
+                    for rev in self._flush_reasoning_if_needed():
+                        yield rev
+                    for cev in self._ensure_visible_content_if_empty():
+                        yield cev
+                    if not self.completed:
+                        self.completed = True
+                        comp_ev = self._build_completed_event()
+                        yield f"event: response.completed\ndata: {json.dumps(comp_ev, ensure_ascii=False)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+
+                try:
+                    data = json.loads(payload)
+                except json.JSONDecodeError:
+                    continue
+
+                if not isinstance(data, dict):
+                    continue
+
+                if "error" in data:
+                    err_ev = {
+                        "type": "response.failed",
+                        "response": {
+                            "id": self.resp_id,
+                            "error": data["error"]
+                        }
+                    }
+                    yield f"event: response.failed\ndata: {json.dumps(err_ev, ensure_ascii=False)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
+
+                if "usage" in data and isinstance(data["usage"], dict):
+                    self.last_usage = data["usage"]
+
+                choices = data.get("choices")
+                if not choices or not isinstance(choices, list) or not isinstance(choices[0], dict):
+                    continue
+
+                c0 = choices[0]
+                delta = c0.get("delta") or {}
+                finish_reason = c0.get("finish_reason")
+
+                raw_reasoning = delta.get("reasoning_content") or delta.get("reasoning") or ""
+                raw_content = delta.get("content") or ""
+                has_tool_calls = bool(delta.get("tool_calls"))
+
+                # 通过 StreamThinkStripper 双重拦截剥离 <thinking> 标签
+                if raw_content:
+                    vis, rsn = self._stripper.feed(raw_content)
+                    raw_content = vis
+                    if rsn:
+                        raw_reasoning = (raw_reasoning + rsn) if raw_reasoning else rsn
+
+                if has_tool_calls or finish_reason:
+                    vis_tail, rsn_tail = self._stripper.finish()
+                    if vis_tail:
+                        raw_content = (raw_content + vis_tail) if raw_content else vis_tail
+                    if rsn_tail:
+                        raw_reasoning = (raw_reasoning + rsn_tail) if raw_reasoning else rsn_tail
+
+                # 处理思维链增量 (reasoning / reasoning_content)
+                if raw_reasoning:
+                    if not self.reasoning_started:
+                        self.reasoning_started = True
+                        add_ev = {
+                            "type": "response.output_item.added",
+                            "output_index": 0,
+                            "item": {
+                                "id": self.rs_item_id,
+                                "type": "reasoning",
+                                "summary": []
+                            }
+                        }
+                        yield f"event: response.output_item.added\ndata: {json.dumps(add_ev, ensure_ascii=False)}\n\n"
+                        part_ev = {
+                            "type": "response.reasoning_summary_part.added",
+                            "item_id": self.rs_item_id,
+                            "output_index": 0,
+                            "summary_index": 0,
+                            "part": {"type": "summary_text", "text": ""}
+                        }
+                        yield f"event: response.reasoning_summary_part.added\ndata: {json.dumps(part_ev, ensure_ascii=False)}\n\n"
+
+                    self.reasoning_content += raw_reasoning
+                    r_ev = {
+                        "type": "response.reasoning_summary_text.delta",
+                        "item_id": self.rs_item_id,
+                        "output_index": 0,
+                        "summary_index": 0,
+                        "delta": raw_reasoning
+                    }
+                    yield f"event: response.reasoning_summary_text.delta\ndata: {json.dumps(r_ev, ensure_ascii=False)}\n\n"
+
+                # 当开始输出文本或工具调用时，闭合之前的思维链事件
+                if (raw_content or has_tool_calls) and self.reasoning_started and not self.reasoning_done:
+                    for rev in self._flush_reasoning_if_needed():
+                        yield rev
+
+                # 处理文本增量
+                if raw_content:
+                    msg_idx = 1 if self.reasoning_started else 0
+                    self.text_content += raw_content
+                    c_ev = {
+                        "type": "response.output_text.delta",
+                        "item_id": self.msg_item_id,
+                        "output_index": msg_idx,
+                        "content_index": 0,
+                        "delta": raw_content
+                    }
+                    yield f"event: response.output_text.delta\ndata: {json.dumps(c_ev, ensure_ascii=False)}\n\n"
+
+                # 处理工具调用
+                tool_calls = delta.get("tool_calls")
+                if tool_calls and isinstance(tool_calls, list):
+                    for tc in tool_calls:
+                        idx = tc.get("index", 0)
+                        if idx not in self.tool_calls:
+                            t_id = tc.get("id") or f"call_{uuid.uuid4().hex[:12]}"
+                            fn = tc.get("function") or {}
+                            name = fn.get("name") or ""
+                            args = fn.get("arguments") or ""
+                            item_id = f"item_{uuid.uuid4().hex[:20]}"
+                            base_offset = (1 if self.reasoning_started else 0) + (1 if self.text_content else 0)
+                            out_idx = base_offset + len(self.tool_calls)
+                            self.tool_calls[idx] = {
+                                "item_id": item_id,
+                                "call_id": t_id,
+                                "name": name,
+                                "arguments": args,
+                                "output_index": out_idx,
+                                "done": False,
+                            }
+                            add_ev = {
+                                "type": "response.output_item.added",
+                                "output_index": out_idx,
+                                "item": {
+                                    "id": item_id,
+                                    "type": "function_call",
+                                    "call_id": t_id,
+                                    "name": name,
+                                    "arguments": ""
+                                }
+                            }
+                            yield f"event: response.output_item.added\ndata: {json.dumps(add_ev, ensure_ascii=False)}\n\n"
+                            if args:
+                                arg_ev = {
+                                    "type": "response.function_call_arguments.delta",
+                                    "item_id": item_id,
+                                    "output_index": out_idx,
+                                    "call_id": t_id,
+                                    "delta": args
+                                }
+                                yield f"event: response.function_call_arguments.delta\ndata: {json.dumps(arg_ev, ensure_ascii=False)}\n\n"
+                        else:
+                            tool = self.tool_calls[idx]
+                            fn = tc.get("function") or {}
+                            args_delta = fn.get("arguments") or ""
+                            if args_delta:
+                                tool["arguments"] += args_delta
+                                arg_ev = {
+                                    "type": "response.function_call_arguments.delta",
+                                    "item_id": tool["item_id"],
+                                    "output_index": tool["output_index"],
+                                    "call_id": tool["call_id"],
+                                    "delta": args_delta
+                                }
+                                yield f"event: response.function_call_arguments.delta\ndata: {json.dumps(arg_ev, ensure_ascii=False)}\n\n"
+
+                if finish_reason:
+                    for rev in self._flush_reasoning_if_needed():
+                        yield rev
+
+                    for cev in self._ensure_visible_content_if_empty():
+                        yield cev
+
+                    for idx in sorted(self.tool_calls.keys()):
+                        tool = self.tool_calls[idx]
+                        if not tool["done"]:
+                            tool["done"] = True
+                            done_ev = {
+                                "type": "response.output_item.done",
+                                "output_index": tool["output_index"],
+                                "item": {
+                                    "id": tool["item_id"],
+                                    "type": "function_call",
+                                    "call_id": tool["call_id"],
+                                    "name": tool["name"],
+                                    "arguments": tool["arguments"]
+                                }
+                            }
+                            yield f"event: response.output_item.done\ndata: {json.dumps(done_ev, ensure_ascii=False)}\n\n"
+
+                    if not self.completed:
+                        self.completed = True
+                        comp_ev = self._build_completed_event()
+                        yield f"event: response.completed\ndata: {json.dumps(comp_ev, ensure_ascii=False)}\n\n"
+
+        vis_tail, rsn_tail = self._stripper.finish()
+        if rsn_tail:
+            self.reasoning_content += rsn_tail
+        if vis_tail:
+            self.text_content += vis_tail
+
+        for rev in self._flush_reasoning_if_needed():
+            yield rev
+
+        for cev in self._ensure_visible_content_if_empty():
+            yield cev
+
+        for idx in sorted(self.tool_calls.keys()):
+            tool = self.tool_calls[idx]
+            if not tool["done"]:
+                tool["done"] = True
+                done_ev = {
+                    "type": "response.output_item.done",
+                    "output_index": tool["output_index"],
+                    "item": {
+                        "id": tool["item_id"],
+                        "type": "function_call",
+                        "call_id": tool["call_id"],
+                        "name": tool["name"],
+                        "arguments": tool["arguments"]
+                    }
+                }
+                yield f"event: response.output_item.done\ndata: {json.dumps(done_ev, ensure_ascii=False)}\n\n"
+
+        if not self.completed:
+            self.completed = True
+            comp_ev = self._build_completed_event()
+            yield f"event: response.completed\ndata: {json.dumps(comp_ev, ensure_ascii=False)}\n\n"
+            yield "data: [DONE]\n\n"
+
+    def _build_completed_event(self) -> dict:
+        output_items = []
+        if self.reasoning_content:
+            output_items.append({
+                "id": self.rs_item_id,
+                "type": "reasoning",
+                "summary": [{"type": "summary_text", "text": self.reasoning_content}]
+            })
+        if self.text_content and self.text_content.strip():
+            output_items.append({
+                "id": self.msg_item_id,
+                "type": "message",
+                "status": "completed",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": self.text_content.strip()}]
+            })
+        for idx in sorted(self.tool_calls.keys()):
+            t = self.tool_calls[idx]
+            output_items.append({
+                "id": t["item_id"],
+                "type": "function_call",
+                "call_id": t["call_id"],
+                "name": t["name"],
+                "arguments": t["arguments"]
+            })
+        usage_obj = None
+        if self.last_usage:
+            pt = self.last_usage.get("prompt_tokens", 0)
+            ct = self.last_usage.get("completion_tokens", 0)
+            usage_obj = {
+                "input_tokens": pt,
+                "output_tokens": ct,
+                "total_tokens": self.last_usage.get("total_tokens", pt + ct),
+            }
+        return {
+            "type": "response.completed",
+            "response": {
+                "id": self.resp_id,
+                "object": "response",
+                "created_at": self.created,
+                "status": "completed",
+                "model": self.model,
+                "output": output_items,
+                "usage": usage_obj
+            }
+        }
+
