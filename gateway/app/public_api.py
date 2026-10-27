@@ -1044,7 +1044,7 @@ async def _probe_stream_start(source, probe_seconds: float, max_buffered_lines: 
 async def _handle_stream_request(
     scheduler, client_id, key_id, model,
     upstream_url, headers, body, timeout, start_time, request, in_chain=False,
-    responses_mode=False, client_override=None
+    responses_mode=False, client_override=None, request_start=None
 ):
     """处理流式SSE请求
 
@@ -1178,6 +1178,9 @@ async def _handle_stream_request(
     except Exception:
         _req_body_json = ""
 
+    # 客户端视角的请求起点（含网关选 key/调度耗时），用于首字与总使用时长口径
+    client_start = request_start or start_time
+
     # 创建流式生成器（: 带keepalive和per-chunk空闲检测）
     async def stream_generator():
         prompt_tokens = 0
@@ -1186,6 +1189,7 @@ async def _handle_stream_request(
         cached_tokens = 0
         cache_write_tokens = 0
         first_byte_received = False
+        first_content_ts = None  # 首个真实内容/思考/工具调用块的到达时刻
         last_data_time = time.time()  # 上次收到上游数据的时间
         last_keepalive_time = time.time()  # 上次发送keepalive的时间
         chunks_received = 0  # 已接收的SSE事件数
@@ -1195,8 +1199,17 @@ async def _handle_stream_request(
         seen_upstream_error = ""  # 捕获的上游错误信息
         seen_finish_reason = None  # 记录已收到的结束原因，防止后续usage块冲掉
         seen_done = False  # 记录是否收到[DONE]
+        seen_tool_calls = False  # 记录流中是否已有工具调用
+        accumulated_visible_content = ""  # 累计正文（用于嵌入工具调用提取与意图自愈）
+        has_tools = bool(body.get("tools"))
         from app.think_stripper import StreamThinkStripper, strip_think_tags
         think_stripper = StreamThinkStripper()
+
+        def _timing_values():
+            """(首字时长ms, 总使用时长ms)，均为客户端视角。"""
+            ttft = (first_content_ts - client_start) * 1000 if first_content_ts else 0.0
+            total = (time.time() - client_start) * 1000
+            return ttft, total
 
         def _final_error_payload(err_text: str) -> str:
             """最终错误附完整候选尝试链（控制台详情按 JSON 渲染时间线）。
@@ -1243,6 +1256,7 @@ async def _handle_stream_request(
                     yield "data: [DONE]\n\n"
                     seen_done = True
                     scheduler.release_client_request(client_id)
+                    _ttft_err, _total_err = _timing_values()
                     await _log_request(
                         client_id, key_id, model, 504, rt,
                         prompt_tokens, completion_tokens, total_tokens, True,
@@ -1253,6 +1267,7 @@ async def _handle_stream_request(
                         business_code="upstream_idle_timeout",
                         request_path=str(request.url.path), http_method=request.method,
                         client_ip=get_client_ip(request), user_agent=request.headers.get("user-agent", "")[:512],
+                        ttft_ms=_ttft_err, total_duration_ms=_total_err,
                     )
                     return
 
@@ -1281,6 +1296,7 @@ async def _handle_stream_request(
                                 scheduler.trigger_hard_cooldown(key_id, model, "upstream_stream_error")
                                 _record_committed_stream_failure(model, reason=seen_upstream_error, is_severe=True)
                                 scheduler.release_client_request(client_id)
+                                _ttft_err, _total_err = _timing_values()
                                 await _log_request(
                                     client_id, key_id, model, 502, rt, prompt_tokens, completion_tokens, total_tokens, True,
                                     _final_error_payload(f"上游流式错误: {seen_upstream_error}"), start_ts=start_time,
@@ -1290,6 +1306,7 @@ async def _handle_stream_request(
                                     request_path=getattr(request, 'url', None) and str(request.url.path) or "",
                                     http_method=getattr(request, 'method', ''), client_ip=get_client_ip(request),
                                     user_agent=getattr(request, 'headers', {}).get('user-agent', '')[:512] if hasattr(request, 'headers') else "",
+                                    ttft_ms=_ttft_err, total_duration_ms=_total_err,
                                 )
                                 return
                         except json.JSONDecodeError:
@@ -1351,6 +1368,7 @@ async def _handle_stream_request(
                                 scheduler.trigger_hard_cooldown(key_id, model, "upstream_stream_error")
                                 _record_committed_stream_failure(model, reason=seen_upstream_error, is_severe=True)
                                 scheduler.release_client_request(client_id)
+                                _ttft_err, _total_err = _timing_values()
                                 await _log_request(
                                     client_id, key_id, model, 502, rt, prompt_tokens, completion_tokens, total_tokens, True,
                                     _final_error_payload(f"上游流式错误: {seen_upstream_error}"), start_ts=start_time,
@@ -1360,6 +1378,7 @@ async def _handle_stream_request(
                                     request_path=getattr(request, 'url', None) and str(request.url.path) or "",
                                     http_method=getattr(request, 'method', ''), client_ip=get_client_ip(request),
                                     user_agent=getattr(request, 'headers', {}).get('user-agent', '')[:512] if hasattr(request, 'headers') else "",
+                                    ttft_ms=_ttft_err, total_duration_ms=_total_err,
                                 )
                                 return
                             # 提取 usage: 兼容 OpenAI, Azure, Anthropic, Responses API, OneAPI 等多种格式与嵌套位置
@@ -1384,6 +1403,8 @@ async def _handle_stream_request(
                                 else:
                                     c = data["choices"][0]
                                     delta = (c.get("delta") if isinstance(c, dict) else {}) or {}
+                                    if delta.get("tool_calls") or delta.get("function_call"):
+                                        seen_tool_calls = True
 
                                     # 剥离并提取思维链标签（<thinking>, <think>, <thought>, <reasoning>）
                                     delta_content = delta.get("content")
@@ -1393,6 +1414,7 @@ async def _handle_stream_request(
                                         if rsn_text:
                                             rsn_to_emit = rsn_text
                                         if vis_text:
+                                            accumulated_visible_content += vis_text
                                             delta["content"] = vis_text
                                         else:
                                             delta.pop("content", None)
@@ -1417,6 +1439,8 @@ async def _handle_stream_request(
                                         }
                                         yield f"data: {json.dumps(rsn_chunk, ensure_ascii=False)}\n\n"
                                         raw_content_chunks += 1
+                                        if first_content_ts is None:
+                                            first_content_ts = now
 
                                     # 规范化 reasoning -> reasoning_content
                                     if "reasoning" in delta and "reasoning_content" not in delta:
@@ -1437,6 +1461,8 @@ async def _handle_stream_request(
                                             or delta.get("reasoning") or delta.get("tool_calls")
                                             or delta.get("function_call") or delta.get("text")):
                                         raw_content_chunks += 1
+                                        if first_content_ts is None:
+                                            first_content_ts = now
 
                                     line = f"data: {json.dumps(data, ensure_ascii=False)}"
                         except json.JSONDecodeError:
@@ -1488,6 +1514,7 @@ async def _handle_stream_request(
                 scheduler.trigger_hard_cooldown(key_id, model, "empty_stream")
                 _record_committed_stream_failure(model, reason="empty_stream", is_severe=True)
                 scheduler.release_client_request(client_id)
+                _ttft_err, _total_err = _timing_values()
                 await _log_request(
                     client_id, key_id, model, 502, rt,
                     prompt_tokens, completion_tokens, total_tokens, True, _final_error_payload(err_desc),
@@ -1499,6 +1526,7 @@ async def _handle_stream_request(
                     http_method=getattr(request, 'method', ''),
                     client_ip=get_client_ip(request),
                     user_agent=getattr(request, 'headers', {}).get('user-agent', '')[:512] if hasattr(request, 'headers') else "",
+                    ttft_ms=_ttft_err, total_duration_ms=_total_err,
                 )
                 return
 
@@ -1510,6 +1538,7 @@ async def _handle_stream_request(
                     if tail_rsn:
                         flushed_delta["reasoning_content"] = tail_rsn
                     if tail_vis:
+                        accumulated_visible_content += tail_vis
                         flushed_delta["content"] = tail_vis
                     flushed_chunk = {
                         "id": f"chatcmpl_{uuid.uuid4().hex[:12]}",
@@ -1519,6 +1548,68 @@ async def _handle_stream_request(
                         "choices": [{"index": 0, "delta": flushed_delta, "finish_reason": seen_finish_reason or None}]
                     }
                     yield f"data: {json.dumps(flushed_chunk, ensure_ascii=False)}\n\n"
+
+                # 智能工具调用补全与行动意图拦截 (Auto-Nudge / Tool Call Parser)
+                if has_tools and not seen_tool_calls and accumulated_visible_content and not seen_upstream_error:
+                    try:
+                        from app.tool_call_parser import parse_raw_tool_calls, is_unexecuted_action_intent
+                    except ImportError:
+                        from gateway.app.tool_call_parser import parse_raw_tool_calls, is_unexecuted_action_intent
+                    clean_text, extracted_tcs = parse_raw_tool_calls(accumulated_visible_content)
+                    if extracted_tcs:
+                        logger.info(f"从流式内容中提取到嵌入工具调用: {[t['function']['name'] for t in extracted_tcs]}")
+                        tc_chunk = {
+                            "id": f"chatcmpl_{uuid.uuid4().hex[:12]}",
+                            "object": "chat.completion.chunk",
+                            "created": int(time.time()),
+                            "model": model,
+                            "choices": [{"index": 0, "delta": {"tool_calls": extracted_tcs}, "finish_reason": "tool_calls"}]
+                        }
+                        yield f"data: {json.dumps(tc_chunk, ensure_ascii=False)}\n\n"
+                        seen_tool_calls = True
+                    elif is_unexecuted_action_intent(accumulated_visible_content):
+                        # 模型只输出了口头行动承诺（如 "Scene complete. Rendering to check."），执行自动呼叫补全
+                        try:
+                            logger.info(f"检测到模型行动意图未落地工具调用 ('{accumulated_visible_content.strip()[:60]}...')，执行 Auto-Nudge 补全")
+                            nudge_msgs = list(body.get("messages", []))
+                            nudge_msgs.append({"role": "assistant", "content": accumulated_visible_content.strip()})
+                            nudge_msgs.append({
+                                "role": "user",
+                                "content": f"[System Protocol: You announced an immediate action ('{accumulated_visible_content.strip()[:80]}') but did not issue a tool call. You must invoke the required tool call directly now.]"
+                            })
+                            nudge_payload = dict(body)
+                            nudge_payload["messages"] = nudge_msgs
+                            nudge_payload["stream"] = False
+                            nudge_payload["tool_choice"] = "auto"
+
+                            nudge_resp = await pool.post(
+                                upstream_url,
+                                headers=headers,
+                                json=nudge_payload,
+                                timeout=httpx.Timeout(20.0, connect=10.0),
+                            )
+                            if nudge_resp.status_code == 200:
+                                n_data = nudge_resp.json()
+                                if n_data.get("choices") and isinstance(n_data["choices"][0], dict):
+                                    n_c0 = n_data["choices"][0]
+                                    n_msg = n_c0.get("message") or {}
+                                    n_tcs = n_msg.get("tool_calls")
+                                    if not n_tcs and n_msg.get("content"):
+                                        _, n_tcs = parse_raw_tool_calls(n_msg["content"])
+                                    if n_tcs:
+                                        logger.info(f"Auto-Nudge 成功补全工具调用: {[t.get('function', {}).get('name') for t in n_tcs]}")
+                                        n_chunk = {
+                                            "id": f"chatcmpl_{uuid.uuid4().hex[:12]}",
+                                            "object": "chat.completion.chunk",
+                                            "created": int(time.time()),
+                                            "model": model,
+                                            "choices": [{"index": 0, "delta": {"tool_calls": n_tcs}, "finish_reason": "tool_calls"}]
+                                        }
+                                        yield f"data: {json.dumps(n_chunk, ensure_ascii=False)}\n\n"
+                                        seen_tool_calls = True
+                        except Exception as ne:
+                            logger.warning(f"Auto-Nudge 尝试补全失败 (放行): {ne}")
+
                 yield "data: [DONE]\n\n"
 
             # 正常结束：所有数据已接收完毕
@@ -1529,6 +1620,10 @@ async def _handle_stream_request(
             # v10.0 防呆防傻：记录熔断器成功
             cb = get_circuit_breaker()
             cb.record_success(f"model:{model}")
+
+            # 首字时长（客户端视角）/ 总使用时长（客户端视角）
+            ttft_value = (first_content_ts - client_start) * 1000 if first_content_ts else 0.0
+            total_value = (time.time() - client_start) * 1000
 
             # 记录请求日志（全量日志）
             await _log_request(
@@ -1541,6 +1636,8 @@ async def _handle_stream_request(
                 user_agent=getattr(request, 'headers', {}).get('user-agent', '')[:512] if hasattr(request, 'headers') else "",
                 cached_tokens=cached_tokens,
                 cache_write_tokens=cache_write_tokens,
+                ttft_ms=ttft_value,
+                total_duration_ms=total_value,
             )
             return  # 正常返回，不执行下面的错误处理
 
@@ -1555,6 +1652,7 @@ async def _handle_stream_request(
             if not seen_done:
                 yield "data: [DONE]\n\n"
             scheduler.release_client_request(client_id)
+            _ttft_err, _total_err = _timing_values()
             await _log_request(
                 client_id, key_id, model, 504, rt, 0, 0, 0, True, _final_error_payload("上游响应超时"),
                 start_ts=start_time,
@@ -1563,6 +1661,7 @@ async def _handle_stream_request(
                 business_code="upstream_timeout",
                 request_path=str(request.url.path), http_method=request.method,
                 client_ip=get_client_ip(request), user_agent=request.headers.get("user-agent", "")[:512],
+                ttft_ms=_ttft_err, total_duration_ms=_total_err,
             )
         except httpx.ReadError as e:
             rt = time.time() - start_time
@@ -1580,6 +1679,7 @@ async def _handle_stream_request(
             if not seen_done:
                 yield "data: [DONE]\n\n"
             scheduler.release_client_request(client_id)
+            _ttft_err, _total_err = _timing_values()
             await _log_request(
                 client_id, key_id, model, 502, rt,
                 prompt_tokens, completion_tokens, total_tokens, True,
@@ -1591,6 +1691,7 @@ async def _handle_stream_request(
                 business_code="stream_interrupted",
                 request_path=str(request.url.path), http_method=request.method,
                 client_ip=get_client_ip(request), user_agent=request.headers.get("user-agent", "")[:512],
+                ttft_ms=_ttft_err, total_duration_ms=_total_err,
             )
         except Exception as e:
             rt = time.time() - start_time
@@ -1606,6 +1707,7 @@ async def _handle_stream_request(
             yield "data: [DONE]\n\n"
             scheduler.release_client_request(client_id)
             # : 记录流式异常日志
+            _ttft_err, _total_err = _timing_values()
             await _log_request(
                 client_id, key_id, model, 500, rt, 0, 0, 0, True, _final_error_payload(f"流式传输错误: {str(e)}"),
                 start_ts=start_time,
@@ -1615,6 +1717,7 @@ async def _handle_stream_request(
                 business_code="stream_error",
                 request_path=str(request.url.path), http_method=request.method,
                 client_ip=get_client_ip(request), user_agent=request.headers.get("user-agent", "")[:512],
+                ttft_ms=_ttft_err, total_duration_ms=_total_err,
             )
         finally:
             await resp.aclose()
@@ -1635,7 +1738,7 @@ async def _handle_stream_request(
 async def _handle_nonstream_request(
     scheduler, client_id, key_id, model,
     upstream_url, headers, body, timeout, start_time, request=None, in_chain=False,
-    responses_mode=False, client_override=None
+    responses_mode=False, client_override=None, request_start=None
 ):
     """处理非流式请求
 
@@ -1649,6 +1752,9 @@ async def _handle_nonstream_request(
     （由链路层统一释放）。普通单模型路径 in_chain=False，行为保持不变。
     """
     pool = client_override or await scheduler.get_http_pool()
+
+    # 客户端视角起点（含网关调度耗时）
+    client_start = request_start or start_time
 
     try:
         resp = await pool.post(
@@ -1685,9 +1791,13 @@ async def _handle_nonstream_request(
             ) if isinstance(data, dict) else {}
             prompt_tokens, completion_tokens, total_tokens, cached_tokens, cache_write_tokens = _extract_usage_tokens(u)
 
-            # 剥离并提取思维链标签（<thinking>, <think>, <thought>, <reasoning>）
+            # 剥离并提取思维链标签（<thinking>, <think>, <thought>, <reasoning>）与嵌入工具调用
             if isinstance(data, dict) and data.get("choices"):
                 from app.think_stripper import strip_think_tags
+                try:
+                    from app.tool_call_parser import parse_raw_tool_calls, is_unexecuted_action_intent
+                except ImportError:
+                    from gateway.app.tool_call_parser import parse_raw_tool_calls, is_unexecuted_action_intent
                 for choice in data["choices"]:
                     if isinstance(choice, dict):
                         msg = choice.get("message")
@@ -1695,12 +1805,56 @@ async def _handle_nonstream_request(
                             content = msg.get("content")
                             if isinstance(content, str) and content:
                                 clean_vis, extracted_rsn = strip_think_tags(content)
+                                # 检查是否有嵌入的文本格式工具调用
+                                clean_vis, extracted_tcs = parse_raw_tool_calls(clean_vis)
+                                if extracted_tcs and not msg.get("tool_calls"):
+                                    msg["tool_calls"] = extracted_tcs
+                                    choice["finish_reason"] = "tool_calls"
                                 msg["content"] = clean_vis
                                 if extracted_rsn:
                                     existing_rsn = msg.get("reasoning_content") or msg.get("reasoning") or ""
                                     msg["reasoning_content"] = (existing_rsn + "\n" + extracted_rsn).strip() if existing_rsn else extracted_rsn
                             if "reasoning" in msg and "reasoning_content" not in msg:
                                 msg["reasoning_content"] = msg.pop("reasoning")
+
+                # 如果模型只有口头行动宣告而未发起工具调用，且客户端传入了 tools
+                if bool(body.get("tools")) and data["choices"] and isinstance(data["choices"][0], dict):
+                    c0 = data["choices"][0]
+                    m0 = c0.get("message") or {}
+                    if not m0.get("tool_calls") and is_unexecuted_action_intent(m0.get("content") or ""):
+                        try:
+                            logger.info(f"非流式: 检测到模型行动意图未落地工具调用 ('{(m0.get('content') or '').strip()[:60]}...')，执行 Auto-Nudge 补全")
+                            nudge_msgs = list(body.get("messages", []))
+                            nudge_msgs.append({"role": "assistant", "content": (m0.get("content") or "").strip()})
+                            nudge_msgs.append({
+                                "role": "user",
+                                "content": f"[System Protocol: You announced an immediate action ('{(m0.get('content') or '').strip()[:80]}') but did not issue a tool call. You must invoke the required tool call directly now.]"
+                            })
+                            nudge_payload = dict(body)
+                            nudge_payload["messages"] = nudge_msgs
+                            nudge_payload["stream"] = False
+                            nudge_payload["tool_choice"] = "auto"
+                            client = client_override or http_client
+                            nudge_resp = await client.post(
+                                effective_upstream_url,
+                                headers=headers,
+                                json=nudge_payload,
+                                timeout=httpx.Timeout(20.0, connect=10.0),
+                            )
+                            if nudge_resp.status_code == 200:
+                                n_data = nudge_resp.json()
+                                if n_data.get("choices") and isinstance(n_data["choices"][0], dict):
+                                    n_c0 = n_data["choices"][0]
+                                    n_msg = n_c0.get("message") or {}
+                                    n_tcs = n_msg.get("tool_calls")
+                                    if not n_tcs and n_msg.get("content"):
+                                        _, n_tcs = parse_raw_tool_calls(n_msg["content"])
+                                    if n_tcs:
+                                        m0["tool_calls"] = n_tcs
+                                        c0["finish_reason"] = "tool_calls"
+                                        logger.info(f"非流式 Auto-Nudge 成功补全工具调用: {[t.get('function', {}).get('name') for t in n_tcs]}")
+                        except Exception as ne:
+                            logger.warning(f"非流式 Auto-Nudge 失败 (放行): {ne}")
 
             scheduler.record_response(key_id, model, True, rt, 200, "")
             scheduler.release_client_request(client_id)
@@ -1721,6 +1875,8 @@ async def _handle_nonstream_request(
                 user_agent=request.headers.get("user-agent", "")[:512] if request else "",
                 cached_tokens=cached_tokens,
                 cache_write_tokens=cache_write_tokens,
+                ttft_ms=(time.time() - client_start) * 1000,
+                total_duration_ms=(time.time() - client_start) * 1000,
             )
 
             return JSONResponse(status_code=200, content=data)
@@ -1964,13 +2120,15 @@ async def _dispatch_once(
             return await _handle_stream_request(
                 scheduler, client_id, key_id, model,
                 effective_upstream_url, headers, body, timeout, start_time, request,
-                in_chain=in_chain, responses_mode=responses_mode, client_override=client_override
+                in_chain=in_chain, responses_mode=responses_mode, client_override=client_override,
+                request_start=dispatch_start_time or start_time,
             )
         else:
             return await _handle_nonstream_request(
                 scheduler, client_id, key_id, model,
                 effective_upstream_url, headers, body, timeout, start_time, request,
-                in_chain=in_chain, responses_mode=responses_mode, client_override=client_override
+                in_chain=in_chain, responses_mode=responses_mode, client_override=client_override,
+                request_start=dispatch_start_time or start_time,
             )
     except (UpstreamRetryableError, UpstreamRequestError, UpstreamModelUnavailableError):
         # 链路层负责请求级终止、候选切换以及整链唯一一次并发释放。
@@ -2558,6 +2716,8 @@ def _log_request_sync(
     cache_write_tokens: int = 0,
     include_errors: bool = False,
     force_log_category: str = "",
+    ttft_ms: float = 0.0,
+    total_duration_ms: float = 0.0,
 ):
     """记录日志到数据库
 
@@ -2580,6 +2740,16 @@ def _log_request_sync(
         now_str = localnow()
         latency_ms = round(rt * 1000, 3)
         latency_us = int(rt * 1_000_000)
+
+        # 首字时长 / 总使用时长：兼容历史行（未记录新字段时按端到端延迟兜底）
+        try:
+            ttft_value = round(float(ttft_ms), 3) if ttft_ms and float(ttft_ms) > 0 else None
+        except (TypeError, ValueError):
+            ttft_value = None
+        try:
+            total_value = round(float(total_duration_ms), 3) if total_duration_ms and float(total_duration_ms) > 0 else latency_ms
+        except (TypeError, ValueError):
+            total_value = latency_ms
 
         started_at = ""
         completed_at = ""
@@ -2625,8 +2795,8 @@ def _log_request_sync(
                 request_path, http_method, client_ip, user_agent,
                 request_params, request_body, response_body,
                 error_type, error_detail, error_stack, business_code, log_category, gateway_dispatch_ms,
-                cached_tokens, cache_write_tokens, cost, currency)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, 0, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+                cached_tokens, cache_write_tokens, cost, currency, ttft_ms, total_duration_ms)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, 0, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
             (
                 str(uuid.uuid4()), client_id, key_id, model,
                 status_code, latency_ms, latency_us,
@@ -2638,6 +2808,7 @@ def _log_request_sync(
                 error_type, error_detail, error_stack, business_code, log_category,
                 round(gateway_dispatch_ms, 2),
                 cached_tokens, cache_write_tokens, cost, currency,
+                ttft_value, total_value,
             ),
         )
 

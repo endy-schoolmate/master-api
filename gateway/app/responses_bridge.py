@@ -429,8 +429,15 @@ def responses_request_to_chat(body: dict) -> dict:
                 elif isinstance(item, dict):
                     role = item.get("role")
                     itype = item.get("type")
-                    if itype == "function_call":
+                    if itype in ("function_call", "custom_tool_call"):
                         call_id = item.get("call_id") or item.get("id") or ""
+                        args = item.get("arguments")
+                        if not args and "input" in item:
+                            inp = item["input"]
+                            if isinstance(inp, dict):
+                                args = json.dumps(inp, ensure_ascii=False)
+                            else:
+                                args = json.dumps({"input": inp}, ensure_ascii=False)
                         messages.append({
                             "role": "assistant",
                             "content": None,
@@ -439,12 +446,12 @@ def responses_request_to_chat(body: dict) -> dict:
                                 "type": "function",
                                 "function": {
                                     "name": item.get("name", ""),
-                                    "arguments": item.get("arguments") or "{}",
+                                    "arguments": args or "{}",
                                 }
                             }]
                         })
-                    elif itype == "function_call_output":
-                        call_id = item.get("call_id") or ""
+                    elif itype in ("function_call_output", "custom_tool_call_output"):
+                        call_id = item.get("call_id") or item.get("id") or ""
                         out_val = item.get("output", "")
                         if isinstance(out_val, (dict, list)):
                             out_val = json.dumps(out_val, ensure_ascii=False)
@@ -484,16 +491,48 @@ def responses_request_to_chat(body: dict) -> dict:
         for t in tools:
             if not isinstance(t, dict):
                 continue
-            if t.get("type") == "function":
+            t_type = t.get("type")
+            if t_type in ("function", "custom"):
+                custom_data = t.get("custom") if isinstance(t.get("custom"), dict) else {}
+                name = custom_data.get("name") or t.get("name") or ""
+                desc = custom_data.get("description") or t.get("description", "")
+                params = custom_data.get("parameters") or t.get("parameters")
                 if "function" in t and isinstance(t["function"], dict):
-                    chat_tools.append(t)
-                else:
-                    fn = {"name": t.get("name", "")}
-                    if "description" in t:
-                        fn["description"] = t["description"]
-                    if "parameters" in t:
-                        fn["parameters"] = t["parameters"]
+                    fn = dict(t["function"])
+                    if fn.get("name") == "apply_patch" and (not fn.get("parameters") or not fn["parameters"].get("properties")):
+                        fn["parameters"] = {
+                            "type": "object",
+                            "properties": {
+                                "input": {
+                                    "type": "string",
+                                    "description": "The complete diff patch text starting with *** Begin Patch and ending with *** End Patch"
+                                }
+                            },
+                            "required": ["input"]
+                        }
                     chat_tools.append({"type": "function", "function": fn})
+                else:
+                    if name == "apply_patch" and (not params or not isinstance(params, dict) or not params.get("properties")):
+                        params = {
+                            "type": "object",
+                            "properties": {
+                                "input": {
+                                    "type": "string",
+                                    "description": "The complete diff patch text starting with *** Begin Patch and ending with *** End Patch"
+                                }
+                            },
+                            "required": ["input"]
+                        }
+                    elif not params or not isinstance(params, dict):
+                        params = {"type": "object", "properties": {}}
+                    chat_tools.append({
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "description": desc,
+                            "parameters": params,
+                        }
+                    })
             else:
                 chat_tools.append(t)
         if chat_tools:
@@ -527,6 +566,17 @@ def responses_request_to_chat(body: dict) -> dict:
     else:
         chat_body["max_tokens"] = 65536
 
+    # 注入 Agent ReAct 协议：防止模型在有 tools 时仅输出行动叙述而漏发工具调用
+    try:
+        try:
+            from app.tool_call_parser import inject_agent_react_instructions
+        except ImportError:
+            from gateway.app.tool_call_parser import inject_agent_react_instructions
+        if inject_agent_react_instructions:
+            chat_body = inject_agent_react_instructions(chat_body)
+    except Exception:
+        pass
+
     return chat_body
 
 
@@ -549,6 +599,16 @@ def chat_response_to_responses_api(data: dict, model: str) -> dict:
         if not reasoning and content and isinstance(content, str):
             from app.think_stripper import strip_think_tags
             content, reasoning = strip_think_tags(content)
+
+        if not tool_calls and content and isinstance(content, str):
+            try:
+                from app.tool_call_parser import parse_raw_tool_calls
+            except ImportError:
+                from gateway.app.tool_call_parser import parse_raw_tool_calls
+            clean_c, extracted_tcs = parse_raw_tool_calls(content)
+            if extracted_tcs:
+                content = clean_c
+                tool_calls.extend(extracted_tcs)
 
         if reasoning:
             output_items.append({
@@ -889,6 +949,53 @@ class ChatToResponsesSseAdapter:
                                 yield f"event: response.function_call_arguments.delta\ndata: {json.dumps(arg_ev, ensure_ascii=False)}\n\n"
 
                 if finish_reason:
+                    # 检查文本中是否嵌入了原始工具调用（如 Qwen <tool_call>... 或 Markdown 格式）
+                    if not self.tool_calls and self.text_content:
+                        try:
+                            from app.tool_call_parser import parse_raw_tool_calls
+                        except ImportError:
+                            from gateway.app.tool_call_parser import parse_raw_tool_calls
+                        clean_text, extracted_tcs = parse_raw_tool_calls(self.text_content)
+                        if extracted_tcs:
+                            self.text_content = clean_text
+                            base_offset = (1 if self.reasoning_started else 0) + (1 if self.text_content else 0)
+                            for e_idx, etc in enumerate(extracted_tcs):
+                                e_fn = etc.get("function") or {}
+                                e_name = e_fn.get("name") or ""
+                                e_args = e_fn.get("arguments") or ""
+                                e_item_id = f"item_{uuid.uuid4().hex[:20]}"
+                                e_out_idx = base_offset + e_idx
+                                e_call_id = etc.get("id") or f"call_{uuid.uuid4().hex[:12]}"
+                                self.tool_calls[e_idx] = {
+                                    "item_id": e_item_id,
+                                    "call_id": e_call_id,
+                                    "name": e_name,
+                                    "arguments": e_args,
+                                    "output_index": e_out_idx,
+                                    "done": True,
+                                }
+                                add_ev = {
+                                    "type": "response.output_item.added",
+                                    "output_index": e_out_idx,
+                                    "item": {
+                                        "id": e_item_id,
+                                        "type": "function_call",
+                                        "call_id": e_call_id,
+                                        "name": e_name,
+                                        "arguments": ""
+                                    }
+                                }
+                                yield f"event: response.output_item.added\ndata: {json.dumps(add_ev, ensure_ascii=False)}\n\n"
+                                if e_args:
+                                    arg_ev = {
+                                        "type": "response.function_call_arguments.delta",
+                                        "item_id": e_item_id,
+                                        "output_index": e_out_idx,
+                                        "call_id": e_call_id,
+                                        "delta": e_args
+                                    }
+                                    yield f"event: response.function_call_arguments.delta\ndata: {json.dumps(arg_ev, ensure_ascii=False)}\n\n"
+
                     for rev in self._flush_reasoning_if_needed():
                         yield rev
 

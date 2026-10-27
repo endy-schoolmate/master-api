@@ -192,7 +192,7 @@ def get_ordered_chain(model_id: str) -> list:
     if not raw_chain:
         return []
 
-    strategy = m.get("routing_strategy", "round-robin")
+    strategy = m.get("routing_strategy", "priority")
 
     if strategy == "round-robin":
         with _state_lock:

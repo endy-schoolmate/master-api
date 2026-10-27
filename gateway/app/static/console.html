@@ -36,6 +36,12 @@
   --warning: #f5a623;  --warning-soft: rgba(245,166,35,.13);
   --danger:  #f04438;  --danger-soft:  rgba(240,68,56,.13);
   --info:    #b9b9c3;  --info-soft:    rgba(185,185,195,.13);
+  /* 耗时分档色（极快 / 快 / 中 / 慢 / 超慢） */
+  --dur-great: #35d99a;
+  --dur-good:  #04ac76;
+  --dur-warn:  #f5a623;
+  --dur-slow:  #f07c1e;
+  --dur-bad:   #d3585a;
   --shadow-card: 0 1px 2px rgba(0,0,0,.2);
   --shadow-pop: 0 24px 64px rgba(0,0,0,.55);
 }
@@ -61,6 +67,11 @@ html[data-theme="light"] {
   --warning: #c77700;  --warning-soft: rgba(199,119,0,.1);
   --danger:  #d92d20;  --danger-soft:  rgba(217,45,32,.08);
   --info:    #52525b;  --info-soft:    rgba(82,82,91,.08);
+  --dur-great: #0a9d63;
+  --dur-good:  #048a5e;
+  --dur-warn:  #c77700;
+  --dur-slow:  #d26a1a;
+  --dur-bad:   #d3585a;
   --shadow-card: 0 1px 2px rgba(16,16,20,.05);
   --shadow-pop: 0 24px 64px rgba(16,16,20,.18);
 }
@@ -159,6 +170,20 @@ tr:hover td { background: var(--accent-soft); }
 /* 请求日志表：优化 8 列布局 */
 .logs-table { table-layout: fixed; min-width: 980px; width: 100%; }
 .logs-table th, .logs-table td { padding: 10px 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; vertical-align: middle; }
+
+/* 请求日志：首字 / 总使用时长 双行耗时单元（左色条按行独立着色） */
+.log-duration { display: flex; align-items: stretch; gap: 7px; }
+.log-duration-bar { width: 4px; flex: 0 0 4px; border-radius: 2px; overflow: hidden; background: var(--text-dim); display: flex; flex-direction: column; }
+.log-duration-bar > span { flex: 1 1 0; min-height: 0; }
+.log-duration-body { display: flex; flex-direction: column; justify-content: center; gap: 1px; min-width: 0; }
+.log-duration-row { display: flex; align-items: baseline; gap: 6px; line-height: 1.35; }
+.log-duration-label { color: var(--text-sec); font-size: 12px; font-weight: 600; letter-spacing: .02em; white-space: nowrap; }
+.log-duration-value { font-size: 12.5px; font-weight: 700; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.log-duration-value.is-empty { color: var(--text-dim); font-weight: 400; }
+/* 耗时分档图例 */
+.log-duration-legend { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin: 2px 0 12px; font-size: 11.5px; color: var(--text-dim); }
+.log-duration-legend-item { display: flex; align-items: center; gap: 5px; }
+.log-duration-legend-dot { width: 8px; height: 8px; border-radius: 50%; flex: 0 0 8px; }
 
 /* ============ 成本定价折叠卡片 ============ */
 .pricing-card {
@@ -2445,18 +2470,21 @@ R.logs = async function(page) {
     const total = data.total || logs.length || 0;
     const totalPages = data.total_pages || data.totalPages || Math.ceil(total / 20) || 1;
 
-    // === Logs table (8列: 时间, 客户端, 模型, 状态码, 延迟, Token, 费用, 操作) ===
+    // === Logs table (8列: 时间, 客户端, 模型, 状态码, 首字/耗时, Token, 费用, 操作) ===
     if (logs.length) {
+      const legend = document.createElement('div');
+      legend.innerHTML = formatLogDurationLegend();
+      c.appendChild(legend);
       const wrap = document.createElement('div');
       wrap.className = 'table-wrap';
       let html = '<table class="logs-table"><thead><tr>' +
-        '<th style="width:16%">时间</th>' +
-        '<th style="width:12%">客户端</th>' +
-        '<th style="width:20%">模型</th>' +
-        '<th style="width:8%">状态码</th>' +
-        '<th style="width:10%">延迟</th>' +
-        '<th style="width:16%">Token</th>' +
-        '<th style="width:10%">费用</th>' +
+        '<th style="width:15%">时间</th>' +
+        '<th style="width:11%">客户端</th>' +
+        '<th style="width:19%">模型</th>' +
+        '<th style="width:7%">状态码</th>' +
+        '<th style="width:14%">首字 / 耗时</th>' +
+        '<th style="width:17%">Token</th>' +
+        '<th style="width:9%">费用</th>' +
         '<th style="width:8%">操作</th>' +
         '</tr></thead><tbody>';
       logs.forEach(l => {
@@ -2470,7 +2498,7 @@ R.logs = async function(page) {
           '<td class="text-sm truncate" title="' + escapeHtml(l.client_name || l.client_id || '') + '">' + escapeHtml(l.client_name || l.client_id || '-') + '</td>' +
           '<td class="text-sm truncate" title="' + escapeHtml(l.model || '') + '">' + escapeHtml(l.model || '-') + attemptBadge + '</td>' +
           '<td style="color:' + scColor + ';font-weight:600">' + (sc ?? '-') + '</td>' +
-          '<td>' + formatLatency(l.latency_ms) + '</td>' +
+          '<td>' + formatLogDuration(l) + '</td>' +
           '<td>' + formatLogTokens(l) + '</td>' +
           '<td>' + formatLogCost(l) + '</td>' +
           '<td><button class="btn btn-sm" data-id="' + l.id + '" onclick="viewLogDetail(\'' + l.id + '\')">详情</button></td>' +
@@ -2885,9 +2913,12 @@ function viewLogDetail(id) {
 
       // Summary row
       const costDisplay = formatLogCost(d);
+      const ttftLv = logDurationLevel(d.ttft_ms, 'ttft');
+      const totalLv = logDurationLevel(d.total_duration_ms || d.latency_ms, 'total');
       html += '<div class="stat-grid" style="margin-bottom:12px">' +
         '<div class="stat-card"><div class="stat-label">状态码</div><div class="stat-value" style="color:' + statusColor + '">' + (d.status_code ?? '-') + '</div></div>' +
-        '<div class="stat-card"><div class="stat-label">延迟</div><div class="stat-value">' + formatLatency(d.latency_ms) + '</div></div>' +
+        '<div class="stat-card"><div class="stat-label">首字时长</div><div class="stat-value" style="color:' + ttftLv.color + '">' + formatLogDurationText(d.ttft_ms) + '</div></div>' +
+        '<div class="stat-card"><div class="stat-label">总使用时长</div><div class="stat-value" style="color:' + totalLv.color + '">' + formatLogDurationText(d.total_duration_ms || d.latency_ms) + '</div></div>' +
         '<div class="stat-card"><div class="stat-label">Token</div><div class="stat-value">' + (d.total_tokens ?? '-') + '</div></div>' +
         '<div class="stat-card"><div class="stat-label">费用</div><div class="stat-value">' + costDisplay + '</div></div>' +
         '</div>';
@@ -2914,6 +2945,8 @@ function viewLogDetail(id) {
         {label:'HTTP方法',val:d.http_method},
         {label:'模型',val:d.model},
         {label:'流式',val:d.is_stream ? '是' : '否'},
+        {label:'首字时长',val:d.ttft_ms ? formatLogDurationText(d.ttft_ms) + '（' + ttftLv.label + '）' : ''},
+        {label:'总使用时长',val:formatLogDurationText(d.total_duration_ms || d.latency_ms) + '（' + totalLv.label + '）'},
         {label:'Prompt Token',val:d.prompt_tokens},
         {label:'Completion Token',val:d.completion_tokens},
         {label:'命中缓存 Token',val:d.cached_tokens},
@@ -2993,6 +3026,84 @@ function formatLatency(ms) {
   if (ms >= 60000) return (ms / 60000).toFixed(1) + 'm';
   if (ms >= 1000) return (ms / 1000).toFixed(1) + 's';
   return ms + 'ms';
+}
+
+// 耗时着色分档：极快=亮绿、快=绿、中=黄、慢=橙、超慢=红
+// 首字与总使用时长各自独立分档，阈值不同
+const LOG_DURATION_LEVELS = {
+  ttft: [
+    { max: 2000,  color: 'var(--dur-great)', label: '极快' },
+    { max: 5000,  color: 'var(--dur-good)',  label: '快' },
+    { max: 10000, color: 'var(--dur-warn)',  label: '中' },
+    { max: 15000, color: 'var(--dur-slow)',  label: '慢' },
+    { max: Infinity, color: 'var(--dur-bad)', label: '超慢' },
+  ],
+  total: [
+    { max: 10000,  color: 'var(--dur-great)', label: '极快' },
+    { max: 40000,  color: 'var(--dur-good)',  label: '快' },
+    { max: 60000,  color: 'var(--dur-warn)',  label: '中' },
+    { max: 120000, color: 'var(--dur-slow)',  label: '慢' },
+    { max: Infinity, color: 'var(--dur-bad)', label: '超慢' },
+  ],
+};
+
+function logDurationLevel(ms, kind) {
+  const levels = LOG_DURATION_LEVELS[kind] || LOG_DURATION_LEVELS.total;
+  const v = Number(ms);
+  if (ms === null || ms === undefined || ms === '' || isNaN(v) || v <= 0) {
+    return { color: 'var(--text-dim)', label: '-' };
+  }
+  for (const lv of levels) {
+    if (v <= lv.max) return lv;
+  }
+  return levels[levels.length - 1];
+}
+
+// 耗时文本：统一用秒显示（一位小数），与参考图一致
+function formatLogDurationText(ms) {
+  const v = Number(ms);
+  if (ms === null || ms === undefined || ms === '' || isNaN(v) || v <= 0) return '-';
+  return (v / 1000).toFixed(1) + 's';
+}
+
+// 请求日志：首字 / 总使用时长 双行单元（左色条上=首字、下=总耗时）
+function formatLogDuration(l) {
+  const ttftRaw = (l.ttft_ms === null || l.ttft_ms === undefined) ? null : Number(l.ttft_ms);
+  const ttft = (ttftRaw !== null && !isNaN(ttftRaw) && ttftRaw > 0) ? ttftRaw : null;
+
+  const totalRaw = (l.total_duration_ms === null || l.total_duration_ms === undefined) ? null : Number(l.total_duration_ms);
+  const total = (totalRaw !== null && !isNaN(totalRaw) && totalRaw > 0) ? totalRaw : (Number(l.latency_ms) > 0 ? Number(l.latency_ms) : null);
+
+  const ttftLv = logDurationLevel(ttft, 'ttft');
+  const totalLv = logDurationLevel(total, 'total');
+
+  return '<div class="log-duration" title="首字 ' + formatLogDurationText(ttft) + '（' + ttftLv.label + '） / 总耗时 ' + formatLogDurationText(total) + '（' + totalLv.label + '）">' +
+    '<span class="log-duration-bar">' +
+      '<span style="background:' + ttftLv.color + '"></span>' +
+      '<span style="background:' + totalLv.color + '"></span>' +
+    '</span>' +
+    '<span class="log-duration-body">' +
+      '<span class="log-duration-row"><span class="log-duration-label">首字</span>' +
+      '<span class="log-duration-value' + (ttft === null ? ' is-empty' : '') + '" style="color:' + ttftLv.color + '">' + formatLogDurationText(ttft) + '</span></span>' +
+      '<span class="log-duration-row"><span class="log-duration-label">耗时</span>' +
+      '<span class="log-duration-value' + (total === null ? ' is-empty' : '') + '" style="color:' + totalLv.color + '">' + formatLogDurationText(total) + '</span></span>' +
+    '</span></div>';
+}
+
+// 耗时分档图例
+function formatLogDurationLegend() {
+  const items = [
+    { color: 'var(--dur-great)', label: '极快' },
+    { color: 'var(--dur-good)',  label: '快' },
+    { color: 'var(--dur-warn)',  label: '中' },
+    { color: 'var(--dur-slow)',  label: '慢' },
+    { color: 'var(--dur-bad)',   label: '超慢' },
+  ];
+  return '<div class="log-duration-legend">' +
+    '<span>耗时分档：</span>' +
+    items.map(i => '<span class="log-duration-legend-item"><span class="log-duration-legend-dot" style="background:' + i.color + '"></span>' + i.label + '</span>').join('') +
+    '<span>首字阈值 2/5/10/15s，总耗时阈值 10/40/60/120s</span>' +
+    '</div>';
 }
 
 /* --- Init --- */

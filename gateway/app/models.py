@@ -99,6 +99,10 @@ class RequestLog(Base):
     started_at: Mapped[str] = mapped_column(String, default="")
     completed_at: Mapped[str] = mapped_column(String, default="")
     latency_us: Mapped[int] = mapped_column(Integer, default=0)
+    # 首字时长（TTFT）：客户端请求起点 -> 上游首个有效内容块
+    ttft_ms: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    # 总使用时长：客户端请求起点 -> 响应结束（含首字等待 + 全部生成）
+    total_duration_ms: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
     #  新增：全量请求日志字段
     request_path: Mapped[str] = mapped_column(String, default="")
     http_method: Mapped[str] = mapped_column(String, default="")

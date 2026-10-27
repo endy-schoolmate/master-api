@@ -243,6 +243,8 @@ else:
                     model TEXT,
                     status_code INT,
                     latency_ms INT,
+                    ttft_ms REAL DEFAULT 0,
+                    total_duration_ms REAL DEFAULT 0,
                     retried INT DEFAULT 0,
                     prompt_tokens INT DEFAULT 0,
                     completion_tokens INT DEFAULT 0,
@@ -342,6 +344,8 @@ else:
             ("started_at", "TEXT DEFAULT ''"),
             ("completed_at", "TEXT DEFAULT ''"),
             ("latency_us", "BIGINT DEFAULT 0"),  # 微秒级延迟（1ms=1000us）
+            ("ttft_ms", "REAL DEFAULT 0"),  # 首字时长（TTFT）
+            ("total_duration_ms", "REAL DEFAULT 0"),  # 总使用时长
         ]
         for col_name, col_def in migrations:
             if col_name not in existing_cols:

@@ -1773,6 +1773,8 @@ async def request_logs(
         "created_at": "created_at",
         "latency_ms": "latency_ms",
         "latency_us": "latency_us",
+        "ttft_ms": "ttft_ms",
+        "total_duration_ms": "total_duration_ms",
         "total_tokens": "total_tokens",
         "prompt_tokens": "prompt_tokens",
         "completion_tokens": "completion_tokens",

@@ -157,10 +157,10 @@ async def _flush_logs(batch):
                     request_path, http_method, client_ip, user_agent,
                     request_params, request_body, response_body,
                     error_type, error_detail, error_stack, business_code, log_category, retried,
-                    prompt_tokens, completion_tokens, total_tokens)
+                    prompt_tokens, completion_tokens, total_tokens, ttft_ms, total_duration_ms)
                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                           %s, %s, %s)""",
+                           %s, %s, %s, %s, %s)""",
                 (
                     item["id"], item["client_id"], item["upstream_key_id"], item["model"],
                     item["status_code"], item["latency_ms"], item["latency_us"], item["is_stream"],
@@ -169,6 +169,8 @@ async def _flush_logs(batch):
                     item["request_params"], item["request_body"], item["response_body"],
                     item["error_type"], item["error_detail"], item["error_stack"], item["business_code"],
                     item["log_category"], 0, 0, 0, 0,
+                    item.get("ttft_ms", 0) or 0,
+                    item.get("total_duration_ms", 0) or item["latency_ms"],
                 ),
             )
 
@@ -559,6 +561,8 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
                 "log_category": log_category,
                 "started_at": started_at,
                 "completed_at": completed_at,
+                "ttft_ms": 0,
+                "total_duration_ms": latency_ms,
             })
         except Exception:
             logger.exception("[v10.0] 日志入队异常，不影响请求响应")

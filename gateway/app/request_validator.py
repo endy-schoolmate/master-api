@@ -842,8 +842,8 @@ def validate_request_body(body: dict) -> Optional[str]:
         role = msg.get("role")
         if not role:
             return f"messages[{i}] 缺少 'role' 字段"
-        if role not in ("system", "user", "assistant", "tool", "function"):
-            return f"messages[{i}] 的 role '{role}' 不合法，应为 system/user/assistant/tool/function"
+        if role not in ("system", "developer", "user", "assistant", "tool", "function"):
+            return f"messages[{i}] 的 role '{role}' 不合法，应为 system/developer/user/assistant/tool/function"
         content = msg.get("content")
         has_tool_calls = "tool_calls" in msg
         if content is None and not has_tool_calls:
@@ -920,6 +920,28 @@ def sanitize_parameters(body: dict) -> dict:
         elif not isinstance(stream_val, bool):
             body["stream"] = bool(stream_val)
 
+    # 消息角色标准化：developer -> system（兼容绝大多数第三方 OpenAI 兼容上游）
+    if "messages" in body and isinstance(body["messages"], list):
+        for msg in body["messages"]:
+            if isinstance(msg, dict):
+                if msg.get("role") == "developer":
+                    msg["role"] = "system"
+                # 多模态消息容错：清洗重复拼接的 data URL 前缀（如 data:image/png;base64,data:image/png;base64,...）
+                content = msg.get("content")
+                if isinstance(content, list):
+                    for part in content:
+                        if isinstance(part, dict) and part.get("type") == "image_url":
+                            img_info = part.get("image_url")
+                            if isinstance(img_info, dict):
+                                url = img_info.get("url")
+                                if isinstance(url, str) and url:
+                                    cleaned_url = url
+                                    while re.match(r"^data:[^;]+;base64,data:[^;]+;base64,", cleaned_url, re.I):
+                                        cleaned_url = re.sub(r"^data:[^;]+;base64,", "", cleaned_url, count=1, flags=re.I)
+                                    if cleaned_url != url:
+                                        img_info["url"] = cleaned_url
+                                        corrections.append("image_url 重复 data: 前缀已规范化")
+
     # thinking 参数转换或剥离：OpenAI 兼容端点通常不接受顶层 thinking 参数，而接受 reasoning_effort
     if "thinking" in body:
         thinking_val = body.pop("thinking")
@@ -970,7 +992,20 @@ def sanitize_parameters(body: dict) -> dict:
                 custom_data = tool.get("custom") if isinstance(tool.get("custom"), dict) else {}
                 func_name = custom_data.get("name") or tool.get("name") or f"custom_tool_{idx}"
                 func_desc = custom_data.get("description") or tool.get("description", "")
-                func_params = custom_data.get("parameters") or tool.get("parameters") or {"type": "object", "properties": {}}
+                func_params = custom_data.get("parameters") or tool.get("parameters")
+                if func_name == "apply_patch" and (not func_params or not isinstance(func_params, dict) or not func_params.get("properties")):
+                    func_params = {
+                        "type": "object",
+                        "properties": {
+                            "input": {
+                                "type": "string",
+                                "description": "The complete diff patch text starting with *** Begin Patch and ending with *** End Patch"
+                            }
+                        },
+                        "required": ["input"]
+                    }
+                elif not func_params or not isinstance(func_params, dict):
+                    func_params = {"type": "object", "properties": {}}
                 sanitized_tools.append({
                     "type": "function",
                     "function": {
@@ -982,15 +1017,42 @@ def sanitize_parameters(body: dict) -> dict:
                 corrections.append(f"tools[{idx}] custom工具已转换为function工具")
             elif t_type == "function":
                 if "function" in tool and isinstance(tool["function"], dict):
-                    sanitized_tools.append(tool)
+                    fn = dict(tool["function"])
+                    if fn.get("name") == "apply_patch" and (not fn.get("parameters") or not isinstance(fn.get("parameters"), dict) or not fn["parameters"].get("properties")):
+                        fn["parameters"] = {
+                            "type": "object",
+                            "properties": {
+                                "input": {
+                                    "type": "string",
+                                    "description": "The complete diff patch text starting with *** Begin Patch and ending with *** End Patch"
+                                }
+                            },
+                            "required": ["input"]
+                        }
+                    sanitized_tools.append({"type": "function", "function": fn})
                 elif "name" in tool:
                     # 容错：顶层有 name 但缺少 function 外层的残缺结构
+                    name = tool.get("name")
+                    fn_params = tool.get("parameters")
+                    if name == "apply_patch" and (not fn_params or not isinstance(fn_params, dict) or not fn_params.get("properties")):
+                        fn_params = {
+                            "type": "object",
+                            "properties": {
+                                "input": {
+                                    "type": "string",
+                                    "description": "The complete diff patch text starting with *** Begin Patch and ending with *** End Patch"
+                                }
+                            },
+                            "required": ["input"]
+                        }
+                    elif not fn_params or not isinstance(fn_params, dict):
+                        fn_params = {"type": "object", "properties": {}}
                     sanitized_tools.append({
                         "type": "function",
                         "function": {
-                            "name": tool.get("name"),
+                            "name": name,
                             "description": tool.get("description", ""),
-                            "parameters": tool.get("parameters", {"type": "object", "properties": {}}),
+                            "parameters": fn_params,
                         }
                     })
             elif t_type == "web_search":
@@ -1010,7 +1072,7 @@ def sanitize_parameters(body: dict) -> dict:
 
 
 def validate_and_sanitize(body: dict) -> dict:
-    """组合校验：请求体格式 + 参数容错"""
+    """组合校验：请求体格式 + 参数容错 + Agent ReAct 协议注入"""
     error = validate_request_body(body)
     if error:
         raise HTTPException(status_code=400, detail={
@@ -1020,4 +1082,16 @@ def validate_and_sanitize(body: dict) -> dict:
         })
 
     body = sanitize_parameters(body)
+
+    # 注入 Agent ReAct 协议：防止模型在有 tools 时仅输出行动叙述而漏发工具调用
+    try:
+        try:
+            from app.tool_call_parser import inject_agent_react_instructions
+        except ImportError:
+            from gateway.app.tool_call_parser import inject_agent_react_instructions
+        if inject_agent_react_instructions:
+            body = inject_agent_react_instructions(body)
+    except Exception as e:
+        logger.warning(f"注入 Agent ReAct 协议异常: {e}")
+
     return body
